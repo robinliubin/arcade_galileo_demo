@@ -25,7 +25,7 @@ You need an API key from OpenAI, Arcade, and Galileo. Each dashboard shows the k
 ### OpenAI → `OPENAI_API_KEY`
 
 1. Log in at https://platform.openai.com
-2. **Add a payment method** at https://platform.openai.com/account/billing — new accounts without billing can't call `gpt-4o-mini`. This is the #1 "why doesn't my key work" gotcha.
+2. **Add a payment method** at https://platform.openai.com/account/billing — new accounts without billing can't call `gpt-4o`. This is the #1 "why doesn't my key work" gotcha.
 3. Create a key at https://platform.openai.com/api-keys → **Create new secret key** → copy the `sk-...` value.
 
 ### Arcade → `ARCADE_API_KEY`
@@ -34,14 +34,14 @@ You need an API key from OpenAI, Arcade, and Galileo. Each dashboard shows the k
 2. Go to https://api.arcade.dev/dashboard/api-keys → **Create API Key** → copy the `arc_...` value.
 3. Prefer project-scoped keys (prefix `arc_proj...`) — they're revocable without affecting other projects.
 
-### Galileo → `GALILEO_API_KEY` (+ `GALILEO_CONSOLE_URL` for non-SaaS clusters)
+### Galileo → `GALILEO_API_KEY` (+ optional `GALILEO_CONSOLE_URL` for non-default clusters)
 
-1. Sign up on your cluster's console URL:
+1. Sign up on the cluster you intend to use:
    - **Default SaaS**: https://app.galileo.ai/sign-up
    - **demo-v2**: https://console.demo-v2.galileocloud.io/
-   - **Self-hosted / other clusters**: whatever console URL your team uses
-2. Once logged in, go to **Settings → API Keys** in the console and create a key.
-3. If you're not on the default SaaS cluster, also note your console URL — you'll set `GALILEO_CONSOLE_URL` in `.env` below. The Python SDK reads it automatically; no code change needed.
+   - **Self-hosted / other**: whatever console URL your team uses
+2. In the console, go to **Settings → API Keys** and create a key.
+3. If you're not on the default SaaS cluster, also set `GALILEO_CONSOLE_URL` in `.env` to the cluster's console URL. The `galileo` SDK and `GalileoSpanProcessor` derive the OTLP endpoint from this — no separate endpoint override is needed.
 
 ## 2. Clone and configure
 
@@ -51,101 +51,151 @@ cd arcade_galileo_demo
 cp .env.example .env
 ```
 
-Edit `.env` and fill in the four values:
+Edit `.env` and fill in:
 
 ```env
 OPENAI_API_KEY=sk-...
 ARCADE_API_KEY=arc_...
 GALILEO_API_KEY=...
 
-# Only if targeting a non-SaaS cluster; omit otherwise.
-GALILEO_CONSOLE_URL=https://console.demo-v2.galileocloud.io/
-
 GALILEO_PROJECT=arcade-galileo-demo
-GALILEO_LOG_STREAM=dev
+GALILEO_LOG_STREAM=default
 
-USER_ID=you@example.com
+# Only if targeting a non-default cluster; omit otherwise.
+# GALILEO_CONSOLE_URL=https://console.demo-v2.galileocloud.io/
+
+ARCADE_USER_ID=you@example.com
 ```
 
-**About `USER_ID`**: Arcade requires it on every tool call so it can scope OAuth tokens per end-user. For the default `math` toolkit it's cosmetic — any stable string works. If you later swap to an OAuth toolkit (Gmail, Slack, GitHub-private), use your real email so Arcade can cache OAuth tokens between runs for that identity.
+**About `ARCADE_USER_ID`**: Arcade scopes Google OAuth tokens per `user_id`. Use your real Google email — Gmail and Google Docs tools cache OAuth tokens per `ARCADE_USER_ID`, so reusing the same value lets the demo skip the consent step on subsequent runs.
 
-## 3. First run
+## 3. First run — the Google OAuth dance
 
 ```bash
-uv run python agent.py
+uv run python workflow.py
 ```
 
-On first invocation, `uv` creates `.venv/`, fetches Python 3.12 if needed, and installs from `uv.lock` — takes ~30 seconds. Subsequent runs start instantly.
+On the *very* first invocation, `uv` creates `.venv/`, fetches Python 3.12 if needed, and installs from `uv.lock` — takes ~30 seconds.
 
-**Expected console output** (approximate — the LLM paraphrases):
+Then the workflow runs. The first time `Gmail_ListEmailsByHeader` executes for a fresh `ARCADE_USER_ID`, Arcade returns an authorization URL instead of email data:
 
 ```
-17 × 23 = 391, and √391 ≈ 19.77.
+Loaded 3 tools: Gmail_ListEmailsByHeader, GoogleDocs_CreateDocumentFromText, Gmail_SendEmail
+Executing workflow...
+
+[arcade.execute.Gmail_ListEmailsByHeader] returned authorization_url:
+  https://accounts.google.com/o/oauth2/v2/auth?... (long URL)
 ```
 
-If you see this, the LLM, Arcade, and your API keys are all working. Next, verify the Galileo side.
+Open the URL in your browser, complete Google's consent for `gmail.readonly`, then re-run `uv run python workflow.py`. The same dance repeats for `GoogleDocs_CreateDocumentFromText` (`docs.documents` scope) and `Gmail_SendEmail` (`gmail.send` scope).
 
-## 4. See the trace in Galileo
+After all three scopes are granted, Arcade caches the OAuth tokens per `ARCADE_USER_ID` and subsequent runs are non-interactive.
 
-1. Open your Galileo console URL (the same one in `GALILEO_CONSOLE_URL`, or https://app.galileo.ai if default).
-2. Navigate to project **`arcade-galileo-demo`** → log stream **`dev`**. Both are auto-created on first write if they didn't exist.
+## 4. Successful run — expected output
+
+```
+============================================================
+Arcade + Galileo Integration Demo
+============================================================
+
+Loaded 3 tools: Gmail_ListEmailsByHeader, GoogleDocs_CreateDocumentFromText, Gmail_SendEmail
+Executing workflow...
+
+============================================================
+Workflow completed successfully!
+============================================================
+
+Result:
+I summarized your 3 most recent emails from noreply@arcade.dev into a Google Doc
+titled "Recent Arcade emails — summary" and sent the link to your inbox.
+
+✓ View traces at: https://app.galileo.ai
+  Project:    arcade-galileo-demo
+  Log stream: default
+```
+
+If you see this, the LLM, Arcade OAuth, and Galileo OTLP ingest are all working. Next, verify the Galileo side.
+
+## 5. See the trace in Galileo
+
+1. Open your Galileo console URL (default https://app.galileo.ai, or your cluster's URL if you set `GALILEO_CONSOLE_URL`).
+2. Navigate to project **`arcade-galileo-demo`** → log stream **`default`**.
 3. Open the most recent trace. You should see:
-   - A **workflow span** named `main` at the root.
-   - Three **LLM spans** (Chat Completions calls): the first two return `tool_calls`, the third is the final text answer.
-   - Two **tool spans** named `run_arcade_tool` — one for the multiply, one for the sqrt. Each shows inputs and outputs.
-4. Click an LLM span → **Messages** tab → you'll see the prompt and the `tool_calls[0].function.arguments`. Click the corresponding tool span → input/output match those arguments. That match is the `tool_call_id` link Galileo uses to thread the agent trajectory.
+   - A **Workflow span** named `arcade_galileo_workflow` at the root (typed `WorkflowSpan`, with `input=user_query` and `output=final_answer`).
+   - Four **LLM spans** named `ChatOpenAI` — auto-emitted by `LangChainInstrumentor`, with OpenInference attributes (`llm.input_messages`, `llm.output_messages`, token counts).
+   - Three **Tool spans** named after the Arcade tool (`Gmail_ListEmailsByHeader`, `GoogleDocs_CreateDocumentFromText`, `Gmail_SendEmail`) — typed `ToolSpan`, rendered with the green tool icon, with `input=tool_args`, `output=result`, and `tool_call_id` linking back to the LLM call that requested them.
+4. Click a `ChatOpenAI` span → look at `llm.output_messages` → you'll see the model's `tool_calls` JSON. Click the matching Tool span → its `input` should match those `tool_call` arguments and its `tool_call_id` should equal the LLM's `tool_calls[*].id`. That link makes the agent trajectory visually obvious.
 
-See [call-flow.md](call-flow.md) for a detailed explanation of the span tree and what each field means.
+See [call-flow.md](call-flow.md) for the full trace tree breakdown.
 
-## 5. Customize the demo
+## 6. Customize the demo
 
-### Change the prompt
+### Change the user query
 
-Edit `PROMPT` in `agent.py`. For the `math` toolkit, any multi-step arithmetic prompt produces a multi-tool-call trace.
+Edit the `user_query` string in `execute_workflow()` in `workflow.py`. Any natural-language task that exercises Gmail + Docs will work.
 
-### Swap the Arcade toolkit
+### Swap the Arcade tools
 
-Change `TOOLKIT` in `agent.py`. Options:
+Edit `REQUIRED_ARCADE_TOOLS` in `workflow.py`. Arcade tools are named `<Toolkit>_<ToolName>` (e.g. `Slack_SendMessage`, `Github_CreateIssue`). The demo's `load_arcade_tools()` derives the toolkit name automatically from the underscore split.
 
-| Toolkit | Auth needed? | What it shows |
+| Toolkit | Auth | Notes |
 |---|---|---|
-| `math` | No | Default. Clean single-command demo, multi-step tool use. |
-| `search` / `web` | No (uses Arcade's hosted credentials) | More impressive — real web search result in the trace. |
-| `google` (Gmail/Drive/Calendar), `slack`, `github` | **Yes (OAuth)** | Showcases Arcade's managed-OAuth superpower. **First run** returns an authorization URL the user must visit; subsequent runs reuse the cached token for that `USER_ID`. |
-
-For OAuth toolkits, plan the demo as a two-phase story: first run opens the auth URL (surface it to the audience — explain that Arcade is managing the OAuth flow), second run uses the real tool.
+| `gmail`, `googledocs` (default) | Google OAuth, scoped per `ARCADE_USER_ID` | First-run consent flow per scope |
+| `slack` | Slack OAuth | Same first-run pattern |
+| `github` (private repos) | GitHub OAuth | Same |
+| `math`, `web` | None | Skip the OAuth dance entirely |
 
 ### Use a different LLM
 
-The loop assumes OpenAI's Chat Completions shape. To swap:
-- Different OpenAI model: change `MODEL` in `agent.py` (any function-calling-capable model works — `gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo`).
-- Different provider (Anthropic, etc.): you'd swap both the client AND the message/tool_call handling. Galileo has wrappers for other providers in the same `galileo.<provider>` shape; check the Galileo SDK docs for the current list. The loop itself needs small changes since Anthropic's tool-use format differs from OpenAI's.
+Swap `ChatOpenAI` in `create_agent()` for any other LangChain chat model that supports `bind_tools`:
+
+```python
+from langchain_anthropic import ChatAnthropic
+llm = ChatAnthropic(model="claude-sonnet-4-6", ...)
+```
+
+`LangChainInstrumentor` is provider-agnostic, so the OpenInference spans still flow to Galileo unchanged. (You'd add `langchain-anthropic` via `uv add langchain-anthropic` and set the right API key in `.env`.)
+
+### Send traces somewhere else
+
+Because the demo uses standard OTLP transport, switching observability backends is a one-line change to env vars. Set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_TRACES_HEADERS` to your destination's values, or modify `instrumentation.py` to point at a different endpoint. Common targets: Jaeger (`http://localhost:4318/v1/traces`), Honeycomb, Tempo, Langtrace.
 
 ## Troubleshooting
 
-**`KeyError: 'USER_ID'`** (or any env var)
-You didn't create `.env`, or it's missing a value. Re-run `cp .env.example .env` and fill all five keys.
+**`Error: GALILEO_API_KEY and GALILEO_PROJECT must be set`**
+Missing env vars. Check `.env` exists and has both values filled in.
+
+**`Error: Missing required environment variables`** (from `validate_environment()`)
+The list of missing variables is printed. Most common: `ARCADE_USER_ID` not set (it was renamed from `USER_ID` — old `.env` files need updating).
 
 **`openai.AuthenticationError: Incorrect API key`**
 The `OPENAI_API_KEY` is wrong, revoked, or from a different org. Check https://platform.openai.com/api-keys.
 
-**`openai.PermissionDeniedError` or `insufficient_quota`**
-OpenAI billing isn't set up on the account the key belongs to. Add a payment method at https://platform.openai.com/account/billing.
+**`openai.PermissionDeniedError` / `insufficient_quota`**
+OpenAI billing isn't set up. Add a payment method at https://platform.openai.com/account/billing.
 
 **`arcadepy.AuthenticationError` / `401`**
-The `ARCADE_API_KEY` is wrong or revoked. Regenerate at https://api.arcade.dev/dashboard/api-keys (Arcade stores only a hash — you can't retrieve a lost key, only regenerate).
+The `ARCADE_API_KEY` is wrong. Regenerate at https://api.arcade.dev/dashboard/api-keys.
 
-**`galileo` errors about `GALILEO_CONSOLE_URL`**
-If you set `GALILEO_CONSOLE_URL`, the SDK tries to reach that host. Confirm it's reachable from your network (e.g., `curl https://console.demo-v2.galileocloud.io/`). For default SaaS, leave `GALILEO_CONSOLE_URL` unset.
+**Tool result is an authorization URL instead of data**
+First-run OAuth flow. Open the URL, complete consent, re-run. Each scope (`gmail.readonly`, `docs.documents`, `gmail.send`) needs its own one-time consent.
 
-**No trace appears in Galileo after the script finishes**
-Three things to check in order:
-1. Did the script reach the `finally: galileo_context.flush()` line? If it crashed early on imports, no spans were ever created.
-2. Are you looking at the right project / log stream in the right cluster? `GALILEO_CONSOLE_URL` must match the console you're logged into.
-3. `GALILEO_API_KEY` must belong to the same cluster as `GALILEO_CONSOLE_URL`. A key from app.galileo.ai won't work against demo-v2.
+**`Failed to export span batch code: 401, reason: Unauthorized`** (printed mid-run by the span processor)
+Galileo's OTLP collector rejected the request. The workflow keeps running — OTLP export is async and silent on failure — but no spans reach Galileo. With the `GalileoSpanProcessor` integration the surface area is small; check, in order:
+1. `GALILEO_API_KEY` in `.env` is set, has no surrounding quotes or trailing whitespace, and isn't expired. Regenerate at **Settings → API Keys** if unsure.
+2. **Cluster mismatch.** The key must be issued on the cluster `GALILEO_CONSOLE_URL` points at. A key from app.galileo.ai will not authenticate against demo-v2.galileocloud.io and vice-versa. If you're targeting a non-default cluster, confirm `GALILEO_CONSOLE_URL` in `.env` matches the URL where you created the key.
+3. `galileo_context.init(...)` raised at startup but you ignored the error. Re-run and read the first few lines of stderr — auth failures usually surface there before the OTLP exporter even starts.
 
-**Tool span says `"ERROR: ..."`**
-Arcade returned `status=failed`. The error message is in the span output. Common causes: the LLM invented a tool name that doesn't exist in the toolkit, or passed arguments with the wrong shape (strings vs ints). This is exactly what Galileo is there to surface — no code change needed to see the failure.
+**No trace appears in Galileo after the script finishes** (no 401 either)
+1. Check `force_flush()` was reached. If the script crashed during imports, no spans were created.
+2. Check you're looking at the right project / log stream / cluster. `GALILEO_PROJECT` in `.env` must match the project name in the Galileo UI.
+3. Check `GALILEO_API_KEY` belongs to the same cluster as `GALILEO_CONSOLE_URL`. A key from app.galileo.ai won't authenticate against a self-hosted cluster.
 
-**Galileo spans show the LLM response but no tool spans**
-The LLM chose not to call a tool (answered directly from its own knowledge). Strengthen the prompt — e.g., add "Use tools. Do not compute from memory." The `math` toolkit prompt in `agent.py` already has this.
+**Galileo trace shows `ChatOpenAI` spans but no `arcade.execute.*` or workflow root**
+The manual `tracer.start_as_current_span(...)` calls aren't running. Likely cause: an exception in `load_arcade_tools()` or `create_agent()` before `execute_workflow()` is reached. Check the console for stack traces.
+
+**Galileo trace shows `arcade.execute.*` spans but no `ChatOpenAI`**
+`LangChainInstrumentor().instrument(...)` ran *after* the `ChatOpenAI` was constructed. Verify `from instrumentation import tracer` is at the top of `workflow.py`, before any `langchain_*` imports — and verify `instrumentation.py` imports `LangChainInstrumentor` and calls `.instrument(...)` at module load.
+
+**`arcade.tool.status = "failed"` in a span**
+Arcade returned `result.status == "failed"`. The error message is in `arcade.tool.result`. Common causes: LLM hallucinated a tool name, or passed arguments with wrong shape (strings vs ints).

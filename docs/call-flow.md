@@ -1,6 +1,6 @@
 # Call flow
 
-What actually happens, in order, when you run `uv run python agent.py` with the default `math` toolkit and prompt `"What is 17 * 23, then take the square root of that result? Use tools."`
+What actually happens, in order, when you run `uv run python workflow.py` with the default user query (summarize 3 recent Arcade emails into a Google Doc, then email the link).
 
 ## Sequence diagram
 
@@ -8,138 +8,187 @@ What actually happens, in order, when you run `uv run python agent.py` with the 
 sequenceDiagram
     autonumber
     actor user as You
-    participant agent as agent.py
-    participant galileo as Galileo SDK
+    participant wf as workflow.py
+    participant ins as instrumentation.py
+    participant otlp as Galileo<br/>(OTLP HTTP)
     participant arcade as Arcade
     participant openai as OpenAI
 
-    user->>agent: uv run python agent.py
-    agent->>agent: load_dotenv()  (reads .env)
-    agent->>galileo: galileo_context.init(project, log_stream)
-    agent->>galileo: OpenAI()  ← Galileo-wrapped client
-    agent->>arcade: tools.formatted.list(format="openai", toolkit="math")
-    arcade-->>agent: [Math.Add, Math.Multiply, Math.Sqrt, ...] as OpenAI schemas
+    user->>wf: uv run python workflow.py
+    wf->>ins: import (side-effecting)
+    ins->>ins: load_dotenv(); validate Galileo env
+    ins->>ins: galileo_context.init(project, log_stream)
+    ins->>ins: TracerProvider + add_galileo_span_processor(GalileoSpanProcessor(...))
+    ins->>ins: LangChainInstrumentor().instrument(...)
+    ins-->>wf: tracer
 
-    rect rgba(200,200,255,0.15)
-    note over agent,galileo: @log — workflow span starts
-    agent->>openai: chat.completions.create(messages, tools)
-    openai-->>agent: assistant msg with tool_calls=[Math.Multiply(17,23)]
-    note right of galileo: LLM span auto-logged by wrapper
+    wf->>arcade: tools.formatted.list(format="openai", toolkit="gmail")
+    arcade-->>wf: [Gmail_ListEmailsByHeader, Gmail_SendEmail, ...]
+    wf->>arcade: tools.formatted.list(format="openai", toolkit="googledocs")
+    arcade-->>wf: [GoogleDocs_CreateDocumentFromText, ...]
+    wf->>wf: filter to REQUIRED_ARCADE_TOOLS (3 tools)
 
-    rect rgba(200,255,200,0.15)
-    note over agent,galileo: @log(span_type="tool") — tool span starts
-    agent->>arcade: tools.execute("Math_Multiply", {a:17,b:23}, user_id)
-    arcade-->>agent: 391
-    note right of galileo: tool span auto-logged
+    wf->>wf: ChatOpenAI(model="gpt-4o").bind_tools(tools)
+
+    rect rgba(180,200,255,0.18)
+    note over wf,otlp: tracer.start_as_current_span("arcade_galileo_workflow")
+
+    rect rgba(220,220,255,0.25)
+    note over wf,openai: round 1 — agent picks Gmail_ListEmailsByHeader
+    wf->>openai: agent.invoke(messages)
+    note right of ins: LangChainInstrumentor auto-emits ChatOpenAI span
+    openai-->>wf: AIMessage(tool_calls=[Gmail_ListEmailsByHeader(...)])
     end
 
-    agent->>openai: chat.completions.create(messages incl. tool result, tools)
-    openai-->>agent: assistant msg with tool_calls=[Math.Sqrt(391)]
-    note right of galileo: another LLM span
-
-    rect rgba(200,255,200,0.15)
-    agent->>arcade: tools.execute("Math_Sqrt", {x:391}, user_id)
-    arcade-->>agent: 19.77...
+    rect rgba(220,255,220,0.25)
+    note over wf,arcade: arcade.execute.Gmail_ListEmailsByHeader span
+    wf->>arcade: tools.execute("Gmail_ListEmailsByHeader", {sender, limit:3}, user_id)
+    arcade-->>wf: [{subject, snippet, ...}, ...]
     end
 
-    agent->>openai: chat.completions.create(messages incl. both results, tools)
-    openai-->>agent: assistant msg, no tool_calls, text="17×23 = 391, √391 ≈ 19.77"
+    rect rgba(220,220,255,0.25)
+    note over wf,openai: round 2 — agent picks GoogleDocs_CreateDocumentFromText
+    wf->>openai: agent.invoke(messages incl. email list)
+    openai-->>wf: AIMessage(tool_calls=[GoogleDocs_CreateDocumentFromText(...)])
     end
 
-    agent->>user: prints answer
-    agent->>galileo: galileo_context.flush()  (in finally)
-    galileo-->>galileo: spans uploaded to cluster
+    rect rgba(220,255,220,0.25)
+    wf->>arcade: tools.execute("GoogleDocs_CreateDocumentFromText", {title, text}, user_id)
+    arcade-->>wf: {document_id, document_url}
+    end
+
+    rect rgba(220,220,255,0.25)
+    note over wf,openai: round 3 — agent picks Gmail_SendEmail
+    wf->>openai: agent.invoke(messages incl. doc URL)
+    openai-->>wf: AIMessage(tool_calls=[Gmail_SendEmail(...)])
+    end
+
+    rect rgba(220,255,220,0.25)
+    wf->>arcade: tools.execute("Gmail_SendEmail", {to, subject, body}, user_id)
+    arcade-->>wf: {message_id, status:"sent"}
+    end
+
+    rect rgba(220,220,255,0.25)
+    note over wf,openai: round 4 — agent produces final answer
+    wf->>openai: agent.invoke(messages incl. send confirmation)
+    openai-->>wf: AIMessage(content="Done. Doc created and emailed.")
+    end
+
+    end
+
+    wf->>wf: provider.force_flush() + shutdown()
+    wf-)otlp: BatchSpanProcessor sends OTLP HTTP/protobuf
+    wf-->>user: prints "View traces at: https://app.galileo.ai"
 ```
 
 ## Step-by-step
 
-**1. Env + SDK init (module load, before `main()`)**
+**1. Module init (before `main()`)**
+
+When Python imports `workflow.py`, the `from instrumentation import tracer` line at the top fires `instrumentation.py`'s side effects:
 
 - `load_dotenv()` pulls `.env` into `os.environ`.
-- `galileo_context.init(project=..., log_stream=...)` creates a context that the wrapper and `@log` decorator will attach spans to. Also reads `GALILEO_API_KEY` and `GALILEO_CONSOLE_URL` from env — the latter is what sends traces to the demov2 cluster instead of the default SaaS.
-- `llm = OpenAI()` — this is the Galileo wrapper, not `openai.OpenAI`. Construction patches it for autologging.
-- `arcade = Arcade()` — reads `ARCADE_API_KEY` from env.
+- `GALILEO_API_KEY` and `GALILEO_PROJECT` are validated; missing ones cause an immediate `sys.exit(1)`.
+- `galileo_context.init(project=..., log_stream=...)` resolves the Galileo cluster from `GALILEO_CONSOLE_URL` (or default SaaS), authenticates, and bootstraps the project + log stream.
+- A `TracerProvider` is constructed and `galileo.otel.GalileoSpanProcessor(project=..., logstream=...)` is attached via `otel.add_galileo_span_processor(provider, processor)`. The processor wraps the OTLP exporter and injects routing headers internally.
+- `LangChainInstrumentor().instrument(tracer_provider=...)` patches LangChain so future `ChatOpenAI` constructions are auto-traced.
+
+This ordering matters: the instrumentor must be active *before* `ChatOpenAI(...)` is constructed in `create_agent()`, otherwise the LLM spans never fire.
 
 **2. Tool discovery**
 
-- `list(arcade.tools.formatted.list(format="openai", toolkit="math"))` returns a list of tool definitions already shaped as `{"type": "function", "function": {"name": ..., "description": ..., "parameters": {...}}}`. This is the shape `chat.completions.create(tools=...)` expects. No manual conversion.
-- Iterating the pager (rather than accessing `.items`) handles multi-page toolkits. The `math` toolkit fits in one page, but `google` or `slack` might not.
-
-**3. Agent loop**
-
-A classic OpenAI function-calling loop:
+`load_arcade_tools()` derives the unique toolkit names from `REQUIRED_ARCADE_TOOLS` (`gmail`, `googledocs`), fetches each toolkit's full tool list from Arcade in OpenAI function-calling shape, then filters down to exactly the three required tools:
 
 ```python
-while True:
-    resp = llm.chat.completions.create(model=..., messages=messages, tools=tools)
-    msg = resp.choices[0].message
-    messages.append(msg)
-    if not msg.tool_calls:          # LLM produced a final answer
-        print(msg.content); return
-    for tc in msg.tool_calls:
-        output = run_arcade_tool(tc.function.name, json.loads(tc.function.arguments))
-        messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+needed_toolkits = {name.split("_", 1)[0].lower() for name in REQUIRED_ARCADE_TOOLS}
+by_name = {}
+for toolkit in needed_toolkits:
+    for t in arcade.tools.formatted.list(format="openai", toolkit=toolkit):
+        by_name[t["function"]["name"]] = t
+tools = [by_name[name] for name in REQUIRED_ARCADE_TOOLS if name in by_name]
 ```
 
-For the math prompt, the loop typically runs **three** `chat.completions.create` calls: one to pick `Math_Multiply`, one to pick `Math_Sqrt`, one to produce the final natural-language answer. Two tool executions happen in between.
+Iterating the pager (rather than accessing `.items`) handles toolkits with >1 page of tools — Gmail in particular spans multiple pages.
 
-**4. Tool execution through Arcade**
+**3. Agent construction**
 
 ```python
-@log(span_type="tool")
-def run_arcade_tool(tool_name, tool_args):
-    result = arcade.tools.execute(tool_name=tool_name, input=tool_args, user_id=USER_ID)
-    if result.status == "failed":
-        return f"ERROR: {result.output.error if result.output else 'unknown'}"
-    return json.dumps(result.output.value) if result.output else ""
+llm = ChatOpenAI(model="gpt-4o", temperature=0.7, api_key=...)
+return llm.bind_tools(tools)
 ```
 
-- Arcade returns errors as `result.status == "failed"`, not Python exceptions. Returning the error as the tool output lets the LLM react (retry with different args, apologize, pick a different tool) instead of crashing.
-- `@log(span_type="tool")` captures `tool_name` and `tool_args` as the span's input and the return value as its output. The decorator ties this span to the active trace started by the outer `@log` on `main()`.
+The returned object is a LangChain runnable. Because `LangChainInstrumentor` is already active, this construction is patched and every subsequent `agent.invoke(...)` will emit a `ChatOpenAI` OpenInference span.
 
-**5. Flush on exit**
+**4. The agent loop**
+
+Wrapped in `tracer.start_as_current_span("arcade_galileo_workflow")` so the whole agent trajectory has a single root in Galileo:
 
 ```python
-try:
-    main()
+for round_num in range(1, MAX_WORKFLOW_ROUNDS + 1):
+    ai_message = agent.invoke(messages)
+    messages.append(ai_message)
+    if not ai_message.tool_calls:
+        return ai_message.content     # done
+    for tc in ai_message.tool_calls:
+        with tracer.start_as_current_span(f"arcade.execute.{tc['name']}"):
+            result = arcade.tools.execute(tool_name=tc["name"], input=tc["args"], user_id=...)
+        messages.append({"role": "tool", "tool_call_id": tc["id"], "content": ...})
+```
+
+For the default user query, the loop converges in **4 rounds**:
+
+| Round | LLM picks | Arcade returns |
+|---|---|---|
+| 1 | `Gmail_ListEmailsByHeader(sender="noreply@arcade.dev", limit=3)` | List of 3 email metadata records |
+| 2 | `GoogleDocs_CreateDocumentFromText(title=..., text=summary)` | `{document_id, document_url}` |
+| 3 | `Gmail_SendEmail(to=user_email, subject=..., body=...)` | `{message_id, status:"sent"}` |
+| 4 | Final answer (no `tool_calls`) | — |
+
+**5. OAuth on first run**
+
+The very first time `arcade.tools.execute("Gmail_ListEmailsByHeader", ...)` runs for a fresh `ARCADE_USER_ID`, Arcade returns an authorization URL instead of email data — open it, complete Google's consent for `gmail.readonly`, then re-run. `GoogleDocs_CreateDocumentFromText` and `Gmail_SendEmail` each have their own scope (`docs.documents`, `gmail.send`) and will each return a one-time URL on their first call too.
+
+After all three scopes are granted, Arcade caches the OAuth tokens per `ARCADE_USER_ID` and subsequent runs are non-interactive.
+
+**6. Flush on exit**
+
+```python
 finally:
-    galileo_context.flush()
+    provider.force_flush()
+    provider.shutdown()
 ```
 
-Galileo buffers spans locally and batches uploads. Without `flush()`, a fast-exiting script can return before the spans leave your machine. The `finally` placement means even a crash still ships whatever was captured.
+`BatchSpanProcessor` buffers spans locally and ships them in batches every few seconds. Without `force_flush`, a fast-exiting script can return before the spans leave your machine; the `finally` placement means even an exception still ships whatever was captured.
 
 ## What the Galileo trace looks like
 
-In the Galileo UI, under project `arcade-galileo-demo` / log stream `dev`, one invocation of `agent.py` produces **one trace** shaped like:
+In the Galileo UI, under project `arcade-galileo-demo` / log stream `default`, one invocation of `workflow.py` produces **one trace** shaped like:
 
 ```
-workflow: main                                    (outer @log)
-├── llm: OpenAI Chat Completions                  (1st chat.completions call)
-│   input:  [{"role":"user","content":"What is 17 * 23, ..."}]
-│   output: assistant msg with tool_calls=[Math_Multiply(17,23)]
-│   tokens, model, latency auto-captured
-├── tool: run_arcade_tool                          (1st Arcade call)
-│   input:  {"tool_name":"Math_Multiply","tool_args":{"a":17,"b":23}}
-│   output: "391"
-├── llm: OpenAI Chat Completions                  (2nd call, with 1st tool result in messages)
-│   output: assistant msg with tool_calls=[Math_Sqrt(391)]
-├── tool: run_arcade_tool                          (2nd Arcade call)
-│   input:  {"tool_name":"Math_Sqrt","tool_args":{"x":391}}
-│   output: "19.773"
-└── llm: OpenAI Chat Completions                  (3rd call, final answer)
-    output: assistant msg, no tool_calls, natural-language answer
+arcade_galileo_workflow                        (WorkflowSpan — name, input=user_query, output=final_answer)
+├── ChatOpenAI                                 (OpenInference, auto)
+│   llm.input_messages: [{"role":"user","content":"Find the 3 most recent emails ..."}]
+│   llm.output_messages: [{"role":"assistant","tool_calls":[...]}]
+│   llm.token_count.prompt / completion captured
+├── Gmail_ListEmailsByHeader                   (ToolSpan — name, input=tool_args JSON, output=result, tool_call_id)
+├── ChatOpenAI                                 (round 2 — sees email list, picks doc creation)
+├── GoogleDocs_CreateDocumentFromText          (ToolSpan)
+├── ChatOpenAI                                 (round 3 — sees doc URL, picks send email)
+├── Gmail_SendEmail                            (ToolSpan)
+└── ChatOpenAI                                 (round 4 — produces final natural-language answer)
 ```
 
 **What to point at during a live demo:**
 
-- The **workflow root** shows end-to-end latency and total tokens for the whole agent run.
-- The **LLM spans** show the exact prompts and responses — including the `tool_calls` field that proves the LLM chose the tools itself.
-- The **tool spans** show what actually ran on Arcade, with inputs and outputs. Click one; compare its `input` to the preceding LLM span's `tool_calls[0].function.arguments` — they match. That's the `tool_call_id` link Galileo uses to thread the trace.
+- The **workflow root** shows end-to-end latency and the `workflow.user_query` attribute.
+- Each **ChatOpenAI** span shows the exact prompt and response — including the `tool_calls` field that proves the LLM is choosing tools, not hallucinating.
+- Each **arcade.execute.\*** span shows the input the LLM passed and the result Arcade returned. Comparing the input to the preceding ChatOpenAI's `tool_calls[0].function.arguments` makes the agent-trajectory link visible.
 
 ## Pitfalls the trace helps you catch
 
-- **Tool hallucination**: LLM invents a tool name that doesn't exist → Arcade returns `failed` → tool span shows the error in the output → you can see the LLM's response to the error in the next LLM span.
-- **Argument-shape drift**: LLM passes `{"a":"17","b":"23"}` (strings) when Arcade expects ints → tool span's input shows the bad types.
-- **Silent OAuth stall** (when you swap to an authenticated toolkit): first execute returns an authorization URL instead of the real output → tool span output is the URL string, and the loop's next LLM span shows the model "responding" to the URL instead of a real result.
+- **Tool hallucination**: LLM invents a tool name not in `REQUIRED_ARCADE_TOOLS` → Arcade returns `failed` → `arcade.execute.*` span's `arcade.tool.status` = `"failed"` → next ChatOpenAI span shows the model's recovery (or further failure).
+- **Argument-shape drift**: LLM passes `{"limit":"3"}` (string) when Arcade expects an int → `arcade.tool.args` shows the bad type.
+- **Silent OAuth stall**: first `Gmail_ListEmailsByHeader` returns an authorization URL instead of emails → `arcade.tool.result` is the URL string, and the next ChatOpenAI span shows the model "responding" to the URL instead of email content. Foreground this for live demos.
+- **No spans appear in Galileo**: `force_flush()` was skipped (early crash before `finally`), or `LangChainInstrumentor().instrument(...)` ran *after* `ChatOpenAI(...)` was constructed — both produce the same symptom, both are guarded against by the current code structure.
 
-All three failure modes are visually obvious in the Galileo trace before you even re-read the agent code.
+All four failure modes are visually obvious in the Galileo trace before you even re-read the agent code.

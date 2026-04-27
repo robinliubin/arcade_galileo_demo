@@ -5,10 +5,22 @@ description = "Showcases MCP tool calls via Arcade, observed in Galileo, using r
 requires-python = ">=3.10"
 dependencies = [
     "arcadepy",
-    "galileo[openai]",
-    "openai",
+    "galileo>=2.1.2",
+    "langchain-openai>=1.2.1",
+    "openinference-instrumentation-langchain>=0.1.63",
+    "opentelemetry-api>=1.41.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.41.1",
+    "opentelemetry-sdk>=1.41.1",
     "python-dotenv",
 ]
 
 [tool.uv]
 package = false
+
+# Tell pyright / basedpyright where the project's virtualenv lives so it can
+# resolve `arcadepy`, `langchain_openai`, `opentelemetry`, etc. Without this,
+# IDEs surface false-positive "Import could not be resolved" warnings even
+# though the imports work fine at runtime under `uv run`.
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
