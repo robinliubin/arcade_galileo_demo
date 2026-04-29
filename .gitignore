@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .DS_Store
 .claude/settings.local.json
+
+# MCP OAuth caches (per-developer; persisted by FileTokenStorage in workflow.py)
+.oauth_tokens.json
+.oauth_client.json

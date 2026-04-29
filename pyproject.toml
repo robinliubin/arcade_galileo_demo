@@ -1,24 +1,66 @@
 [project]
 name = "arcade-galileo-demo"
-version = "0.1.0"
-description = "Showcases MCP tool calls via Arcade, observed in Galileo, using raw Python (no agent framework)."
-requires-python = ">=3.10"
+version = "0.2.0"
+description = "MCP tool calls via a local Arcade server, with SEP-2448 server-execution-telemetry passback stitched into Galileo traces."
+requires-python = ">=3.11"
 dependencies = [
-    "arcadepy",
+    # Server side — local MCP server with TelemetryPassbackMiddleware.
+    "arcade-mcp-server>=1.18.0,<2.0.0",
+    # Client side — MCP SDK for OAuth 2.1 + ClientSession + streamable HTTP transport.
+    "mcp>=1.26.0",
+
+    # Galileo — supported OTel integration surface (GalileoSpanProcessor) +
+    # OTLP protobuf encoding for forwarded passback spans.
     "galileo>=2.1.2",
+    "protobuf",
+    "opentelemetry-proto",
+
+    # LangChain agent + OpenInference auto-instrumentation (Galileo renders
+    # the OpenInference attribute schema natively).
     "langchain-openai>=1.2.1",
     "openinference-instrumentation-langchain>=0.1.63",
+
+    # OTel core. opentelemetry-instrumentation-httpx is used by *server.py*
+    # to auto-trace Gmail HTTP calls as child spans under the phase spans.
     "opentelemetry-api>=1.41.1",
-    "opentelemetry-exporter-otlp-proto-http>=1.41.1",
     "opentelemetry-sdk>=1.41.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.41.1",
+    "opentelemetry-instrumentation-httpx",
+
+    "httpx>=0.28.1",
     "python-dotenv",
 ]
 
 [tool.uv]
 package = false
 
+# `arcade-serve==3.2.3` (a transitive of arcade-mcp-server) pins
+# `opentelemetry-exporter-otlp-proto-http==1.28.2` and pins the auto-instrumentation
+# packages to `0.49bX`. `galileo>=2.1.2` needs OTel core `>=1.38.0`. The OTel
+# stable APIs we (and arcade-serve) actually use are unchanged across 1.28→1.41,
+# so we relax those transitive pins via uv's override mechanism rather than
+# editing the sibling repo. This must be `[tool.uv]` (not `[tool.uv.sources]`).
+override-dependencies = [
+    "opentelemetry-api>=1.38.0,<2.0.0",
+    "opentelemetry-sdk>=1.38.0,<2.0.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.38.0,<2.0.0",
+    "opentelemetry-exporter-otlp-proto-common>=1.38.0,<2.0.0",
+    "opentelemetry-instrumentation-fastapi>=0.59b0",
+    "opentelemetry-instrumentation-httpx>=0.59b0",
+    "opentelemetry-instrumentation-aiohttp-client>=0.59b0",
+    "opentelemetry-instrumentation-requests>=0.59b0",
+]
+
+# arcade-mcp-server isn't yet published with `TelemetryPassbackMiddleware`,
+# so install it directly from the sibling arcade-mcp checkout. arcade-serve
+# is a transitive of arcade-mcp-server and pinned the same way to keep the
+# editable install consistent.
+[tool.uv.sources]
+arcade-mcp-server = { path = "../arcade-mcp/libs/arcade-mcp-server", editable = true }
+arcade-serve = { path = "../arcade-mcp/libs/arcade-serve", editable = true }
+
 # Tell pyright / basedpyright where the project's virtualenv lives so it can
-# resolve `arcadepy`, `langchain_openai`, `opentelemetry`, etc. Without this,
+# resolve `arcade_mcp_server`, `mcp`, `langchain_openai`, etc. Without this,
 # IDEs surface false-positive "Import could not be resolved" warnings even
 # though the imports work fine at runtime under `uv run`.
 [tool.pyright]

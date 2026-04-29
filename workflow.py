@@ -1,115 +1,298 @@
-"""LangChain agent loop for the Arcade x Galileo demo.
+"""LangChain agent for the Arcade x Galileo demo with SEP-2448 server-span passback.
 
-Three tools, one trace:
+Two tools, one stitched trace:
 
-* Discovers ``Gmail_ListEmailsByHeader``, ``GoogleDocs_CreateDocumentFromText``,
-  and ``Gmail_SendEmail`` from Arcade (OpenAI-formatted schemas).
-* Binds them to a ``ChatOpenAI`` LangChain runnable.
-* Runs a multi-round loop: LLM picks tools → Arcade executes → repeat
-  until the model produces a final answer (or ``MAX_WORKFLOW_ROUNDS`` is hit).
+* Connects to the local Arcade MCP server (``server.py``) via streamable HTTP.
+* Authenticates using MCP OAuth 2.1 (the MCP SDK opens the browser, runs PKCE,
+  caches tokens to ``.oauth_*.json``).
+* Discovers ``list_emails`` and ``send_email``, exposes them to a
+  ``ChatOpenAI`` LangChain runnable in OpenAI function-calling shape.
+* Runs a multi-round loop: LLM picks tools → MCP call with passback opt-in →
+  server responds with its own phase spans inline in ``_meta.otel`` → we
+  forward those to Galileo so they become children of the agent-side
+  ``ToolSpan`` in the same trace.
 
-OpenTelemetry is configured by the ``instrumentation`` import below.
-That import has side effects (sets up the OTLP exporter, registers the global
-``TracerProvider``, installs the LangChain instrumentor) and **must** run
-before the LangChain agent is constructed — otherwise the auto-instrumentation
-attaches to nothing and no LLM spans reach Galileo.
+OpenTelemetry is configured by the ``instrumentation`` import below. That
+import has side effects (sets up the OTLP exporter via
+``GalileoSpanProcessor``, registers the global ``TracerProvider``, installs
+``LangChainInstrumentor``) and **must** run before the LangChain agent is
+constructed — otherwise the auto-instrumentation attaches to nothing and no
+LLM spans reach Galileo.
+
+The ``--detailed`` flag controls how much of the server's internal tree is
+returned. Without it the server returns only top-level phase spans
+(``auth.validate``, ``gmail.list_messages``, ...). With it, you also get the
+``HTTPXClientInstrumentor`` HTTP child spans under each phase.
 """
 
+from __future__ import annotations
+
+import argparse
+import asyncio
 import json
+import logging
 import os
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
 
-from arcadepy import Arcade, PermissionDeniedError
+import httpx
 from galileo import otel
 from galileo_core.schemas.logging.span import ToolSpan, WorkflowSpan
 from langchain_openai import ChatOpenAI
+from mcp import ClientSession
+from mcp.client.auth import OAuthClientProvider, TokenStorage
+from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
-# Imported for two reasons: (a) side effects — configures Galileo's OTLP processor +
-# LangChain auto-instrumentation as a side effect of module load; (b) explicit access to
-# the tracer provider so we can `force_flush()` + `shutdown()` cleanly on exit.
-from instrumentation import tracer_provider as _tracer_provider
+# Side effects: configures GalileoSpanProcessor + LangChainInstrumentor.
+# Also exports ``ingest_passback_to_galileo`` which we call after every
+# tools/call to forward server-side spans into the same Galileo trace.
+from instrumentation import (
+    ingest_passback_to_galileo,
+    tracer_provider as _tracer_provider,
+)
 
 
-# Constants
 MAX_WORKFLOW_ROUNDS = 5
 DEFAULT_LLM_MODEL = "gpt-4o"
 DEFAULT_LLM_TEMPERATURE = 0.7
+DEFAULT_SERVER_URL = "http://127.0.0.1:8000/mcp"
 
-# Required Arcade tools for this demo workflow
-REQUIRED_ARCADE_TOOLS = [
-    "Gmail_ListEmailsByHeader",
-    "GoogleDocs_CreateDocumentFromText",
-    "Gmail_SendEmail",
-]
+PROJECT_ROOT = Path(__file__).resolve().parent
+OAUTH_TOKEN_FILE = PROJECT_ROOT / ".oauth_tokens.json"
+OAUTH_CLIENT_FILE = PROJECT_ROOT / ".oauth_client.json"
+OAUTH_CALLBACK_PORT = 9905
+OAUTH_REDIRECT_URI = f"http://127.0.0.1:{OAUTH_CALLBACK_PORT}/callback"
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# MCP OAuth 2.1 (handled by the MCP SDK)
+# ---------------------------------------------------------------------------
+
+
+class FileTokenStorage(TokenStorage):
+    """Persist OAuth tokens and client registration to disk between runs."""
+
+    async def get_tokens(self) -> OAuthToken | None:
+        if OAUTH_TOKEN_FILE.exists():
+            return OAuthToken.model_validate_json(OAUTH_TOKEN_FILE.read_text())
+        return None
+
+    async def set_tokens(self, tokens: OAuthToken) -> None:
+        OAUTH_TOKEN_FILE.write_text(tokens.model_dump_json())
+
+    async def get_client_info(self) -> OAuthClientInformationFull | None:
+        if OAUTH_CLIENT_FILE.exists():
+            return OAuthClientInformationFull.model_validate_json(OAUTH_CLIENT_FILE.read_text())
+        return None
+
+    async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
+        OAUTH_CLIENT_FILE.write_text(client_info.model_dump_json())
+
+
+async def _handle_oauth_redirect(authorization_url: str) -> None:
+    """Open the browser for MCP OAuth consent (one-time per fresh ``.oauth_*.json``)."""
+    print("\n  Opening browser for MCP OAuth authorization...")
+    print(f"  URL: {authorization_url}\n")
+    webbrowser.open(authorization_url)
+
+
+async def _handle_oauth_callback() -> tuple[str, str | None]:
+    """Start a local HTTP server, wait for the OAuth redirect, extract the code."""
+    loop = asyncio.get_event_loop()
+    future: asyncio.Future[tuple[str, str | None]] = loop.create_future()
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            qs = parse_qs(urlparse(self.path).query)
+            code = qs.get("code", [None])[0]
+            state = qs.get("state", [None])[0]
+            if code:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(
+                    b"<h2>Authorization successful!</h2><p>You can close this tab.</p>"
+                )
+                loop.call_soon_threadsafe(future.set_result, (code, state))
+            else:
+                error = qs.get("error", ["unknown"])[0]
+                self.send_response(400)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(f"<h2>Authorization failed: {error}</h2>".encode())
+                loop.call_soon_threadsafe(
+                    future.set_exception, RuntimeError(f"OAuth error: {error}")
+                )
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", OAUTH_CALLBACK_PORT), _Handler)
+
+    def _serve() -> None:
+        server.handle_request()
+        server.server_close()
+
+    await loop.run_in_executor(None, _serve)
+    return await future
+
+
+# ---------------------------------------------------------------------------
+# Validation, schema conversion, Google-OAuth-on-first-call dance
+# ---------------------------------------------------------------------------
 
 
 def validate_environment() -> None:
-    """
-    Validate that all required environment variables are set.
+    """Validate that all required environment variables are set.
 
-    Raises:
-        SystemExit: If any required environment variable is missing.
+    ``ARCADE_API_KEY`` is no longer needed by *this* process — we no longer
+    call Arcade Cloud's tool-execution API. The local server still uses
+    Arcade as the OAuth authorization server (token validation) and as the
+    Google OAuth broker (tool ``requires_auth=Google(...)``), and reads
+    those credentials from its own ``.env`` load. ``ARCADE_USER_ID`` is
+    still useful here for printing / templating the user's email into the
+    default query.
     """
     required_vars = {
-        "OPENAI_API_KEY": "OpenAI API key for LLM operations",
-        "ARCADE_API_KEY": "Arcade API key for tool execution",
-        "ARCADE_USER_ID": "Arcade user ID for tool authorization",
-        "GALILEO_API_KEY": "Galileo API key for observability (set in instrumentation.py)",
+        "OPENAI_API_KEY": "OpenAI API key for the LangChain agent",
+        "ARCADE_USER_ID": "Your email — used by Arcade's Google OAuth broker",
+        "GALILEO_API_KEY": "Galileo API key (set in instrumentation.py)",
         "GALILEO_PROJECT": "Galileo project name (set in instrumentation.py)",
     }
-
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    if missing_vars:
+    missing = [var for var in required_vars if not os.getenv(var)]
+    if missing:
         print("Error: Missing required environment variables:", file=sys.stderr)
-        for var in missing_vars:
+        for var in missing:
             print(f"  - {var}: {required_vars[var]}", file=sys.stderr)
         sys.exit(1)
 
 
-def load_arcade_tools() -> Tuple[List[Dict[str, Any]], Arcade, str]:
+def _mcp_to_openai_tool(t: Any) -> dict[str, Any]:
+    """Convert an MCP tool definition to OpenAI function-calling shape.
+
+    The agent uses ``ChatOpenAI.bind_tools(...)`` which expects the OpenAI
+    schema; the local server publishes JSON-Schema input shapes via the
+    standard MCP ``tools/list`` response.
     """
-    Load OpenAI-formatted schemas for the required Arcade tools.
+    schema = t.inputSchema or {"type": "object", "properties": {}}
+    return {
+        "type": "function",
+        "function": {
+            "name": t.name,
+            "description": t.description or f"MCP tool: {t.name}",
+            "parameters": schema,
+        },
+    }
 
-    Returns:
-        Tuple of (selected tool schemas, configured Arcade client, user_id).
 
-    Raises:
-        RuntimeError: If none of the required tools are discovered.
+def _extract_google_auth_url(result: Any) -> str | None:
+    """If a tool result contains an Arcade Google-OAuth URL, return it.
+
+    On the first ``list_emails`` / ``send_email`` for a fresh ``user_id``,
+    the server returns a JSON payload with ``authorization_url`` instead of
+    Gmail data — that's Arcade telling us the user needs to grant Google
+    consent for the relevant scope. We surface the URL, wait for the user
+    to complete consent, then retry the call.
     """
-    arcade = Arcade()
-    user_id = os.environ["ARCADE_USER_ID"]
-
-    needed_toolkits = sorted({name.split("_", 1)[0].lower() for name in REQUIRED_ARCADE_TOOLS})
-    by_name: Dict[str, Dict[str, Any]] = {}
-    for toolkit in needed_toolkits:
-        for t in arcade.tools.formatted.list(format="openai", toolkit=toolkit):
-            by_name[t["function"]["name"]] = t
-
-    tools = [by_name[name] for name in REQUIRED_ARCADE_TOOLS if name in by_name]
-
-    if not tools:
-        raise RuntimeError(
-            f"No required tools found. Expected tools containing: {REQUIRED_ARCADE_TOOLS}"
-        )
-
-    print(f"Loaded {len(tools)} tools: {', '.join(t['function']['name'] for t in tools)}")
-    return tools, arcade, user_id
+    for item in result.content:
+        text = getattr(item, "text", None)
+        if text and "authorization_url" in text:
+            try:
+                data = json.loads(text)
+                return data.get("authorization_url")
+            except (json.JSONDecodeError, TypeError):
+                pass
+    structured = getattr(result, "structuredContent", None)
+    if isinstance(structured, dict):
+        return structured.get("authorization_url")
+    return None
 
 
-def create_agent(tools: List[Dict[str, Any]]) -> Any:
+# ---------------------------------------------------------------------------
+# The actual MCP tool call — with span passback
+# ---------------------------------------------------------------------------
+
+
+async def _call_mcp_tool_with_passback(
+    session: ClientSession,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    tool_call_id: str,
+    detailed: bool,
+    propagator: TraceContextTextMapPropagator,
+) -> str:
+    """Invoke an MCP tool, request server span passback, ingest into Galileo.
+
+    Wraps the call in a Galileo ``ToolSpan`` so the UI renders it with the
+    proper Tool icon and drill-down. Injects ``traceparent`` into
+    ``_meta`` so the server's spans share our trace ID, and opts into
+    passback via ``_meta.otel.traces.{request,detailed}``. On success the
+    server's spans come back under ``response._meta.otel.traces.resourceSpans``
+    and we forward them to Galileo via the helper from ``instrumentation``.
     """
-    Create a LangChain agent with Arcade tools.
+    tool = ToolSpan(
+        name=tool_name,
+        input=json.dumps(tool_args),
+        tool_call_id=tool_call_id,
+    )
+    with otel.start_galileo_span(tool):
+        carrier: dict[str, str] = {}
+        propagator.inject(carrier)
 
-    Args:
-        tools: List of tool definitions in OpenAI format.
+        meta: dict[str, Any] = {
+            "traceparent": carrier.get("traceparent", ""),
+            "otel": {"traces": {"request": True, "detailed": detailed}},
+        }
 
-    Returns:
-        A LangChain runnable that can invoke the LLM with tools.
+        result = await session.call_tool(tool_name, arguments=tool_args, meta=meta)
 
-    Raises:
-        ValueError: If OPENAI_API_KEY is not set.
+        # Arcade's Google OAuth dance — first call per scope returns a URL
+        # instead of data. Surface it, wait for the user, then retry.
+        google_auth_url = _extract_google_auth_url(result)
+        if google_auth_url:
+            print(f"\n  Google OAuth required for {tool_name}.")
+            print(f"  Open this URL in your browser to authorize:\n\n    {google_auth_url}\n")
+            await asyncio.get_event_loop().run_in_executor(
+                None, input, "  Press Enter after authorizing... "
+            )
+            print("  Retrying tool call...\n")
+            result = await session.call_tool(tool_name, arguments=tool_args, meta=meta)
+
+        text = result.content[0].text if result.content else ""
+        # Cap stored tool output to keep span attributes manageable.
+        tool.output = text[:5000]
+
+        ingest_passback_to_galileo(result.meta)
+        return text
+
+
+# ---------------------------------------------------------------------------
+# Multi-round agent loop
+# ---------------------------------------------------------------------------
+
+
+async def execute_workflow(
+    session: ClientSession,
+    mcp_tools: list[Any],
+    user_query: str,
+    detailed: bool,
+) -> str | None:
+    """Run the LangChain agent loop, with each tool call going over MCP.
+
+    Wrapped in a Galileo ``WorkflowSpan`` so the whole trajectory anchors
+    under one root in the UI.
     """
+    propagator = TraceContextTextMapPropagator()
+    openai_tools = [_mcp_to_openai_tool(t) for t in mcp_tools]
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OPENAI_API_KEY must be set")
@@ -118,84 +301,15 @@ def create_agent(tools: List[Dict[str, Any]]) -> Any:
         model=DEFAULT_LLM_MODEL,
         temperature=DEFAULT_LLM_TEMPERATURE,
         api_key=api_key,
-    )
-
-    return llm.bind_tools(tools)
-
-
-def _execute_arcade_tool(
-    arcade: Arcade,
-    tool_name: str,
-    tool_args: Dict[str, Any],
-    user_id: str,
-) -> Any:
-    """
-    Execute an Arcade tool, handling first-run OAuth interactively.
-
-    When ``user_id`` has not yet granted the scope the tool requires, Arcade
-    raises ``PermissionDeniedError`` with body ``tool_authorization_required``.
-    We trigger ``arcade.tools.authorize(...)``, print the consent URL, block
-    on ``arcade.auth.wait_for_completion(...)`` until the user finishes the
-    Google flow, then retry the execute. After the first successful auth per
-    scope, Arcade caches the token for that ``user_id`` and subsequent runs
-    skip this dance.
-    """
-    try:
-        return arcade.tools.execute(tool_name=tool_name, input=tool_args, user_id=user_id)
-    except PermissionDeniedError as e:
-        if "tool_authorization_required" not in str(e):
-            raise
-        auth = arcade.tools.authorize(tool_name=tool_name, user_id=user_id)
-        if auth.status != "completed":
-            print(
-                f"\n  Authorization required for {tool_name}.\n"
-                f"  Open this URL in your browser to authorize Arcade:\n\n"
-                f"    {auth.url}\n"
-            )
-            arcade.auth.wait_for_completion(auth)
-            print("  Authorization complete. Continuing...\n")
-        return arcade.tools.execute(tool_name=tool_name, input=tool_args, user_id=user_id)
-
-
-def execute_workflow(
-    agent: Any,
-    arcade: Arcade,
-    user_id: str,
-) -> Optional[str]:
-    """
-    Execute the email summary workflow with complete tracing.
-
-    This workflow:
-    1. Checks emails from today
-    2. Creates a Google Doc with an email summary
-    3. Sends an email with the doc link
-
-    All operations are traced to Galileo via OpenTelemetry spans.
-
-    Args:
-        agent: LangChain agent with bound tools.
-        arcade: Arcade client for tool execution.
-        user_id: User ID for Arcade tool authorization.
-
-    Returns:
-        Final response from the agent, or None if workflow doesn't complete.
-
-    Raises:
-        Exception: If tool execution fails.
-    """
-    user_query = (
-        "Find the 3 most recent emails I have received from "
-        "alex.salazar@arcade.dev. Summarize them into a single short Google Doc, "
-        "then email me the link to that doc. Use tools."
-    )
+    ).bind_tools(openai_tools)
 
     workflow = WorkflowSpan(name="arcade_galileo_workflow", input=user_query)
     with otel.start_galileo_span(workflow):
-        messages: List[Any] = [{"role": "user", "content": user_query}]
-        final: Optional[str] = None
+        messages: list[Any] = [{"role": "user", "content": user_query}]
+        final: str | None = None
 
         for _round_num in range(1, MAX_WORKFLOW_ROUNDS + 1):
-            ai_message = agent.invoke(messages)
+            ai_message = await llm.ainvoke(messages)
             messages.append(ai_message)
 
             tool_calls = getattr(ai_message, "tool_calls", None) or []
@@ -204,30 +318,17 @@ def execute_workflow(
                 break
 
             for tc in tool_calls:
-                tool_name = tc["name"]
-                tool_args = tc["args"]
-                tool_call_id = tc["id"]
-
-                # ToolSpan + start_galileo_span makes Galileo render this as a
-                # proper Tool span (green icon, drill-down), not a Workflow span.
-                tool = ToolSpan(
-                    name=tool_name,
-                    input=json.dumps(tool_args),
-                    tool_call_id=tool_call_id,
+                output = await _call_mcp_tool_with_passback(
+                    session=session,
+                    tool_name=tc["name"],
+                    tool_args=tc["args"],
+                    tool_call_id=tc["id"],
+                    detailed=detailed,
+                    propagator=propagator,
                 )
-                with otel.start_galileo_span(tool):
-                    result = _execute_arcade_tool(arcade, tool_name, tool_args, user_id)
-
-                    if result.status == "failed":
-                        output = f"ERROR: {result.output.error if result.output else 'unknown'}"
-                    else:
-                        output = json.dumps(result.output.value) if result.output else ""
-
-                    tool.output = output
-
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": tool_call_id,
+                    "tool_call_id": tc["id"],
                     "content": output,
                 })
 
@@ -235,58 +336,129 @@ def execute_workflow(
         return final
 
 
-def main() -> None:
-    """
-    Main entry point for the Arcade + Galileo integration demo.
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-    Validates environment, loads tools, creates agent, and executes workflow.
-    """
-    print("=" * 60)
-    print("Arcade + Galileo Integration Demo")
-    print("=" * 60)
-    print()
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="LangChain agent for the Arcade x Galileo demo with SEP-2448 passback",
+    )
+    parser.add_argument(
+        "query",
+        nargs="?",
+        default=(
+            "Find my 3 most recent emails from alex.salazar@arcade.dev. "
+            "Then email a one-paragraph summary of them to me at $ARCADE_USER_ID."
+        ),
+        help="Natural-language task for the agent (use $ARCADE_USER_ID as a stand-in)",
+    )
+    parser.add_argument(
+        "--detailed",
+        action="store_true",
+        help="Request the full server span tree (incl. HTTPX child spans)",
+    )
+    parser.add_argument(
+        "--server-url",
+        default=DEFAULT_SERVER_URL,
+        help=f"Local MCP server URL (default: {DEFAULT_SERVER_URL})",
+    )
+    return parser.parse_args()
+
+
+def _print_galileo_trace_url() -> None:
+    """Print a deep link to the Galileo trace, falling back to the project view."""
+    from galileo import galileo_context
+    from galileo.config import GalileoPythonConfig
+
+    config = GalileoPythonConfig.get()
+    logger = galileo_context.get_logger_instance()
+    project_id = getattr(logger, "project_id", None)
+    log_stream_id = getattr(logger, "log_stream_id", None)
+
+    if project_id and log_stream_id:
+        print(
+            f"\n✓ View this trace at: "
+            f"{config.console_url}project/{project_id}/log-streams/{log_stream_id}"
+        )
+    else:
+        print(f"\n✓ View traces at: {config.console_url}")
+        print(f"  Project:    {os.getenv('GALILEO_PROJECT')}")
+        print(f"  Log stream: {os.getenv('GALILEO_LOG_STREAM', 'default')}")
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="  %(message)s")
+    args = parse_args()
 
     validate_environment()
+    user_id = os.environ["ARCADE_USER_ID"]
+    user_query = args.query.replace("$ARCADE_USER_ID", user_id)
+
+    print("=" * 60)
+    print("Arcade + Galileo Integration Demo (server-span passback)")
+    print("=" * 60)
+    print(f"\n  Mode:         {'detailed (full tree)' if args.detailed else 'phases only'}")
+    print(f"  MCP server:   {args.server_url}")
+    print(f"  Query:        {user_query}\n")
+
+    # MCP SDK handles OAuth 2.1 automatically:
+    # On 401 it discovers the auth server (RFC 9728), runs PKCE, caches tokens.
+    oauth_auth = OAuthClientProvider(
+        server_url=args.server_url,
+        client_metadata=OAuthClientMetadata(
+            client_name="arcade-galileo-demo-agent",
+            redirect_uris=[OAUTH_REDIRECT_URI],
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",  # OAuth 2.1 public client (no secret)
+        ),
+        storage=FileTokenStorage(),
+        redirect_handler=_handle_oauth_redirect,
+        callback_handler=_handle_oauth_callback,
+    )
+    http_client = httpx.AsyncClient(auth=oauth_auth)
 
     try:
-        tools, arcade, user_id = load_arcade_tools()
-        agent = create_agent(tools)
+        async with (
+            streamable_http_client(url=args.server_url, http_client=http_client) as (
+                read,
+                write,
+                _,
+            ),
+            ClientSession(read, write) as session,
+        ):
+            init = await session.initialize()
+            telemetry_cap = getattr(init.capabilities, "serverExecutionTelemetry", None)
+            print(f"  Server:                       {init.serverInfo.name} v{init.serverInfo.version}")
+            print(f"  serverExecutionTelemetry:     {telemetry_cap is not None}")
+            if telemetry_cap:
+                print(f"  Capability:                   {telemetry_cap}")
 
-        print("Executing workflow...\n")
+            discovered = await session.list_tools()
+            tool_names = [t.name for t in discovered.tools]
+            print(f"  Tools:                        {tool_names}\n")
 
-        result = execute_workflow(agent, arcade, user_id)
-
-        if result:
-            print("\n" + "=" * 60)
-            print("Workflow completed successfully!")
-            print("=" * 60)
-            print(f"\nResult:\n{result}")
-        else:
-            print("\n" + "=" * 60)
-            print("Workflow did not complete")
-            print("=" * 60)
-
-        # Build the trace URL from Galileo's resolved cluster (reads
-        # GALILEO_CONSOLE_URL via GalileoPythonConfig) and the project /
-        # log-stream IDs that galileo_context.init(...) resolved at startup.
-        # This is the same pattern as galileo-test/agents/10_otel_openinference.ipynb.
-        from galileo import galileo_context
-        from galileo.config import GalileoPythonConfig
-
-        config = GalileoPythonConfig.get()
-        logger = galileo_context.get_logger_instance()
-        project_id = getattr(logger, "project_id", None)
-        log_stream_id = getattr(logger, "log_stream_id", None)
-
-        if project_id and log_stream_id:
-            print(
-                f"\n✓ View this trace at: "
-                f"{config.console_url}project/{project_id}/log-streams/{log_stream_id}"
+            print("Executing workflow...\n")
+            result = await execute_workflow(
+                session=session,
+                mcp_tools=discovered.tools,
+                user_query=user_query,
+                detailed=args.detailed,
             )
-        else:
-            print(f"\n✓ View traces at: {config.console_url}")
-            print(f"  Project:    {os.getenv('GALILEO_PROJECT')}")
-            print(f"  Log stream: {os.getenv('GALILEO_LOG_STREAM', 'default')}")
+
+            if result:
+                print("\n" + "=" * 60)
+                print("Workflow completed successfully!")
+                print("=" * 60)
+                print(f"\nResult:\n{result}")
+            else:
+                print("\n" + "=" * 60)
+                print("Workflow did not complete")
+                print("=" * 60)
+
+            _print_galileo_trace_url()
     finally:
         # BatchSpanProcessor buffers spans; flush + shutdown so the trace
         # leaves the machine before the process exits.
@@ -295,4 +467,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
