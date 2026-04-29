@@ -152,6 +152,10 @@ else you need!
 
 ## See the trace in Galileo
 
+![Stitched client+server trace in Galileo (with --detailed)](docs/trace_view.png)
+
+Above: a `--detailed` run from the demo as it renders in Galileo. The agent-side `arcade_galileo_workflow` root, `ChatOpenAI` LLM spans, and `ArcadeGalileoDemoServer_ListEmails`/`SendEmail` ToolSpans are all from this process. Everything underneath each ToolSpan — the `auth.validate`, `gmail.list_messages`/`gmail.fetch_details`/`gmail.send_message` phase spans, and the `GET messages` / `GET messages/<id>` HTTP child spans — comes from the local server via SEP-2448 passback. The waterfall under `gmail.fetch_details` (one HTTP child per message) is the kind of internal detail an agent author normally can't see — that's the value proposition.
+
 Open Galileo UI → project `arcade-galileo-demo` → log stream `default`. Open the most recent trace. You should see a tree shaped like:
 
 ```
