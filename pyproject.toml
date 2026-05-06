@@ -5,8 +5,20 @@ description = "MCP tool calls via a local Arcade server, with SEP-2448 server-ex
 requires-python = ">=3.11"
 dependencies = [
     # Server side — local MCP server with TelemetryPassbackMiddleware.
-    "arcade-mcp-server>=1.18.0,<2.0.0",
+    # 1.21.3 is the first PyPI release that ships TelemetryPassbackMiddleware
+    # (previously this demo installed editable from a sibling clone of
+    # ArcadeAI/arcade-mcp PR #797 because the middleware wasn't published).
+    "arcade-mcp-server>=1.21.3,<2.0.0",
     # Client side — MCP SDK for OAuth 2.1 + ClientSession + streamable HTTP transport.
+    # workflow.py monkey-patches OAuthContext.should_include_resource_param to
+    # suppress the RFC 8707 `resource=<server_url>` parameter. Reason: when the
+    # local server publishes Protected Resource Metadata (RFC 9728) the SDK
+    # would normally send `resource=http://127.0.0.1:8000/mcp` to Arcade Cloud,
+    # which then performs a back-channel HTTP fetch to validate that resource —
+    # but localhost isn't reachable from cloud.arcade.dev, so Arcade returns
+    # `server_error | description: Could not retrieve protected resource metadata
+    # for the gateway`. Suppressing the parameter skips Arcade's back-channel
+    # validation. For production / non-local servers, remove the monkey-patch.
     "mcp>=1.26.0",
 
     # Galileo — supported OTel integration surface (GalileoSpanProcessor) +
@@ -34,12 +46,14 @@ dependencies = [
 [tool.uv]
 package = false
 
-# `arcade-serve==3.2.3` (a transitive of arcade-mcp-server) pins
-# `opentelemetry-exporter-otlp-proto-http==1.28.2` and pins the auto-instrumentation
-# packages to `0.49bX`. `galileo>=2.1.2` needs OTel core `>=1.38.0`. The OTel
-# stable APIs we (and arcade-serve) actually use are unchanged across 1.28→1.41,
-# so we relax those transitive pins via uv's override mechanism rather than
-# editing the sibling repo. This must be `[tool.uv]` (not `[tool.uv.sources]`).
+# `arcade-serve` (a transitive of arcade-mcp-server) historically pinned
+# `opentelemetry-exporter-otlp-proto-http==1.28.2` and the auto-instrumentation
+# packages to `0.49bX`, while `galileo>=2.1.2` needs OTel core `>=1.38.0`. The
+# OTel stable APIs we (and arcade-serve) actually use are unchanged across
+# 1.28→1.41, so we relax those transitive pins via uv's override mechanism
+# rather than waiting for an upstream `arcade-serve` release. Recent PyPI
+# versions of `arcade-serve` may have already loosened these — keeping the
+# override is harmless safety net. (Note: must be `[tool.uv]`, not `[tool.uv.sources]`.)
 override-dependencies = [
     "opentelemetry-api>=1.38.0,<2.0.0",
     "opentelemetry-sdk>=1.38.0,<2.0.0",
@@ -50,14 +64,6 @@ override-dependencies = [
     "opentelemetry-instrumentation-aiohttp-client>=0.59b0",
     "opentelemetry-instrumentation-requests>=0.59b0",
 ]
-
-# arcade-mcp-server isn't yet published with `TelemetryPassbackMiddleware`,
-# so install it directly from the sibling arcade-mcp checkout. arcade-serve
-# is a transitive of arcade-mcp-server and pinned the same way to keep the
-# editable install consistent.
-[tool.uv.sources]
-arcade-mcp-server = { path = "../arcade-mcp/libs/arcade-mcp-server", editable = true }
-arcade-serve = { path = "../arcade-mcp/libs/arcade-serve", editable = true }
 
 # Tell pyright / basedpyright where the project's virtualenv lives so it can
 # resolve `arcade_mcp_server`, `mcp`, `langchain_openai`, etc. Without this,

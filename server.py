@@ -8,8 +8,9 @@ Vendor-side reference for cross-org distributed tracing:
   (``auth.validate``, ``gmail.*``, ``format_response``) that the middleware
   collects and serializes inline on the ``tools/call`` response.
 * ``HTTPXClientInstrumentor`` auto-creates HTTP child spans under
-  ``gmail.fetch_details`` / ``gmail.send_message`` so ``--detailed`` passback
-  reveals the per-message HTTP waterfall.
+  ``gmail.fetch_details`` / ``gmail.send_message``. The agent's default
+  passback request asks for full detail, so these HTTP spans ride back
+  inline and reveal the per-message waterfall in Galileo.
 * Does NOT export spans externally — the agent ingests them via passback.
 
 Adapted from ``arcade-mcp/examples/mcp_servers/telemetry_passback/src/
@@ -131,7 +132,20 @@ resource_server_auth = ArcadeResourceServerAuth(
             issuer="https://cloud.arcade.dev/oauth2",
             jwks_uri="https://cloud.arcade.dev/.well-known/jwks/oauth2",
             algorithm="Ed25519",
-            expected_audiences=[CANONICAL_URL],
+            # Accept BOTH:
+            #  - `urn:arcade:mcp` — Arcade's generic URN for MCP-fronted
+            #    resources, issued when the client suppresses RFC 8707
+            #    `resource=` (workflow.py does this — see comment block there
+            #    explaining why localhost can't do RFC 8707 audience binding).
+            #  - CANONICAL_URL — the per-instance URL, issued when the client
+            #    sends `resource=<canonical_url>` and Arcade can validate it
+            #    via back-channel PRM fetch. Use this mode if/when you expose
+            #    server.py via a public URL (ngrok / production deploy).
+            #
+            # Trust derives from `iss` + JWKS signature verification, not from
+            # audience narrowing — accepting both audience values is safe
+            # because both come from the same authorization server.
+            expected_audiences=[CANONICAL_URL, "urn:arcade:mcp"],
         ),
     ],
 )

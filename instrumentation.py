@@ -190,7 +190,9 @@ def ingest_passback_to_galileo(meta: Any) -> None:
 
     print(f"  Server-side spans: {span_count} received and forwarded to Galileo")
     if truncated:
-        print(f"  ({dropped} additional spans available with --detailed)")
+        # Unreachable from this demo (we always send detailed=True), but kept
+        # for any future client that opts into phase-only passback.
+        print(f"  ({dropped} additional spans were filtered server-side)")
 
     try:
         from google.protobuf.json_format import ParseDict

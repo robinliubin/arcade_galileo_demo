@@ -19,10 +19,13 @@ import has side effects (sets up the OTLP exporter via
 constructed — otherwise the auto-instrumentation attaches to nothing and no
 LLM spans reach Galileo.
 
-The ``--detailed`` flag controls how much of the server's internal tree is
-returned. Without it the server returns only top-level phase spans
-(``auth.validate``, ``gmail.list_messages``, ...). With it, you also get the
-``HTTPXClientInstrumentor`` HTTP child spans under each phase.
+By default, every ``tools/call`` requests SEP-2448 passback with full detail —
+the server returns its phase spans (``auth.validate``, ``gmail.list_messages``,
+``gmail.fetch_details``, ``format_response``) plus the ``HTTPXClientInstrumentor``
+HTTP child spans under each phase. Pass ``--no-passback`` to disable the opt-in
+entirely; the server returns no ``resourceSpans`` and Galileo sees only the
+agent-side ``ToolSpan`` for each call (server is a black box, useful for
+showing what observability looks like *without* SEP-2448).
 """
 
 from __future__ import annotations
@@ -39,29 +42,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-import httpx
-from galileo import otel
-from galileo_core.schemas.logging.span import ToolSpan, WorkflowSpan
-from langchain_openai import ChatOpenAI
-from mcp import ClientSession
-from mcp.client.auth import OAuthClientProvider, TokenStorage
-from mcp.client.streamable_http import streamable_http_client
-from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
-from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
-
-# Side effects: configures GalileoSpanProcessor + LangChainInstrumentor.
-# Also exports ``ingest_passback_to_galileo`` which we call after every
-# tools/call to forward server-side spans into the same Galileo trace.
-from instrumentation import (
-    ingest_passback_to_galileo,
-    tracer_provider as _tracer_provider,
-)
-
+from dotenv import load_dotenv
 
 MAX_WORKFLOW_ROUNDS = 5
 DEFAULT_LLM_MODEL = "gpt-4o"
 DEFAULT_LLM_TEMPERATURE = 0.7
 DEFAULT_SERVER_URL = "http://127.0.0.1:8000/mcp"
+DEFAULT_LOG_STREAM_BASE = "arcade-galileo-demo"
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 OAUTH_TOKEN_FILE = PROJECT_ROOT / ".oauth_tokens.json"
@@ -70,6 +57,123 @@ OAUTH_CALLBACK_PORT = 9905
 OAUTH_REDIRECT_URI = f"http://127.0.0.1:{OAUTH_CALLBACK_PORT}/callback"
 
 log = logging.getLogger(__name__)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse CLI args.
+
+    Defined and called at module load time so the per-mode log stream name
+    (computed below from ``--no-passback``) can be set in ``os.environ``
+    *before* the ``instrumentation`` import runs — that import is
+    side-effecting and reads ``GALILEO_LOG_STREAM`` to call
+    ``galileo_context.init(...)`` and configure ``GalileoSpanProcessor``.
+    """
+    parser = argparse.ArgumentParser(
+        description="LangChain agent for the Arcade x Galileo demo with SEP-2448 passback",
+    )
+    parser.add_argument(
+        "query",
+        nargs="?",
+        default=(
+            "Find my 3 most recent emails from alex.salazar@arcade.dev. "
+            "Then email a one-paragraph summary of them to me at $ARCADE_USER_ID."
+        ),
+        help="Natural-language task for the agent (use $ARCADE_USER_ID as a stand-in)",
+    )
+    parser.add_argument(
+        "--no-passback",
+        action="store_true",
+        help=(
+            "Disable SEP-2448 server-execution telemetry passback. "
+            "Server appears as a black box in Galileo (agent-side ToolSpan only, "
+            "no phase or HTTPX spans). Default: passback enabled with full detail. "
+            "Each mode writes to a differently-suffixed Galileo log stream "
+            "(``-passback`` vs ``-no-passback``) so the two shapes are easy to "
+            "compare side-by-side in the UI."
+        ),
+    )
+    parser.add_argument(
+        "--server-url",
+        default=DEFAULT_SERVER_URL,
+        help=f"Local MCP server URL (default: {DEFAULT_SERVER_URL})",
+    )
+    return parser.parse_args()
+
+
+# === Module-load-time side effects ===
+# 1. Load .env so any user-set GALILEO_LOG_STREAM is visible below.
+# 2. Parse CLI to learn passback mode.
+# 3. Suffix the log stream name so passback / no-passback runs land in
+#    different Galileo log streams (e.g. ``arcade-galileo-demo-passback`` vs
+#    ``arcade-galileo-demo-no-passback``). The suffix is unconditional —
+#    if the user customized GALILEO_LOG_STREAM in .env, they still get
+#    differentiated streams (e.g. ``my-base-passback`` / ``my-base-no-passback``).
+# 4. Then import ``instrumentation`` (side-effecting; reads GALILEO_LOG_STREAM).
+
+load_dotenv(PROJECT_ROOT / ".env")
+_cli_args = parse_args()
+_passback = not _cli_args.no_passback
+
+_log_stream_base = os.getenv("GALILEO_LOG_STREAM", DEFAULT_LOG_STREAM_BASE)
+_mode_suffix = "passback" if _passback else "no-passback"
+os.environ["GALILEO_LOG_STREAM"] = f"{_log_stream_base}-{_mode_suffix}"
+
+# Heavy third-party imports below. ``instrumentation`` is the side-effecting
+# Galileo OTel boot (calls galileo_context.init, registers the processor,
+# installs LangChainInstrumentor). It reads GALILEO_LOG_STREAM from env, so
+# the assignment above must happen before this import block.
+
+import httpx  # noqa: E402
+from galileo import otel  # noqa: E402
+from galileo_core.schemas.logging.span import ToolSpan, WorkflowSpan  # noqa: E402
+from langchain_openai import ChatOpenAI  # noqa: E402
+from mcp import ClientSession  # noqa: E402
+from mcp.client.auth import OAuthClientProvider, TokenStorage  # noqa: E402
+from mcp.client.streamable_http import streamable_http_client  # noqa: E402
+from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken  # noqa: E402
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator  # noqa: E402
+
+from instrumentation import (  # noqa: E402
+    ingest_passback_to_galileo,
+    tracer_provider as _tracer_provider,
+)
+
+
+# ---------------------------------------------------------------------------
+# Workaround: suppress RFC 8707 `resource=<url>` on OAuth requests
+# ---------------------------------------------------------------------------
+#
+# The MCP SDK (since ~1.25) sends `resource=<server_url>` on the authorize URL
+# whenever the resource server publishes Protected Resource Metadata (RFC 9728).
+# Our local server does publish PRM (it's how the MCP SDK discovers Arcade
+# Cloud as the auth server in the first place), so the SDK always includes
+# `resource=http://127.0.0.1:8000/mcp` in OAuth requests.
+#
+# Arcade Cloud's authorization server then performs a back-channel HTTP fetch
+# of the resource's PRM endpoint to validate it. That request goes from
+# `cloud.arcade.dev` to `http://127.0.0.1:8000` — i.e. from Arcade's cloud to
+# *your* localhost — which is unreachable. Result on the OAuth callback:
+#
+#   OAuth error: server_error | description: Could not retrieve protected
+#   resource metadata for the gateway. Verify that the gateway is reachable
+#   and configured correctly.
+#
+# Suppressing the resource parameter (returning False from the decision
+# helper) skips Arcade's back-channel validation, and the rest of the OAuth
+# flow proceeds normally. Trade-off: tokens issued without resource binding
+# could in principle be used against a different MCP server — but for a
+# local demo where the only MCP server in question is the one on this laptop,
+# that's not a meaningful attack surface.
+#
+# **Remove this patch** if you ever expose `server.py` via a publicly
+# reachable URL (e.g. ngrok tunnel) and update CANONICAL_URL accordingly —
+# at that point Arcade's back-channel validation will succeed and the
+# parameter is the proper RFC 8707 audience binding.
+from mcp.client.auth.oauth2 import OAuthContext  # noqa: E402
+
+OAuthContext.should_include_resource_param = (  # type: ignore[method-assign]
+    lambda self, protocol_version=None: False
+)
 
 
 # ---------------------------------------------------------------------------
@@ -123,13 +227,31 @@ async def _handle_oauth_callback() -> tuple[str, str | None]:
                 )
                 loop.call_soon_threadsafe(future.set_result, (code, state))
             else:
+                # Surface the full RFC 6749 error response (error +
+                # error_description + error_uri) so the user can diagnose
+                # auth-server-side failures. Without error_description the
+                # only signal is the opaque error code (e.g. ``server_error``).
                 error = qs.get("error", ["unknown"])[0]
+                error_description = qs.get("error_description", [""])[0]
+                error_uri = qs.get("error_uri", [""])[0]
+                detail_parts = [f"OAuth error: {error}"]
+                if error_description:
+                    detail_parts.append(f"description: {error_description}")
+                if error_uri:
+                    detail_parts.append(f"more info: {error_uri}")
+                detail = " | ".join(detail_parts)
+
                 self.send_response(400)
                 self.send_header("Content-Type", "text/html")
                 self.end_headers()
-                self.wfile.write(f"<h2>Authorization failed: {error}</h2>".encode())
+                html = (
+                    f"<h2>Authorization failed: {error}</h2>"
+                    + (f"<p>{error_description}</p>" if error_description else "")
+                    + (f'<p>More info: <a href="{error_uri}">{error_uri}</a></p>' if error_uri else "")
+                )
+                self.wfile.write(html.encode())
                 loop.call_soon_threadsafe(
-                    future.set_exception, RuntimeError(f"OAuth error: {error}")
+                    future.set_exception, RuntimeError(detail)
                 )
 
         def log_message(self, fmt: str, *args: Any) -> None:
@@ -221,22 +343,31 @@ def _extract_google_auth_url(result: Any) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-async def _call_mcp_tool_with_passback(
+async def _call_mcp_tool(
     session: ClientSession,
     tool_name: str,
     tool_args: dict[str, Any],
     tool_call_id: str,
-    detailed: bool,
+    passback: bool,
     propagator: TraceContextTextMapPropagator,
 ) -> str:
-    """Invoke an MCP tool, request server span passback, ingest into Galileo.
+    """Invoke an MCP tool, optionally requesting server span passback.
 
     Wraps the call in a Galileo ``ToolSpan`` so the UI renders it with the
-    proper Tool icon and drill-down. Injects ``traceparent`` into
-    ``_meta`` so the server's spans share our trace ID, and opts into
-    passback via ``_meta.otel.traces.{request,detailed}``. On success the
-    server's spans come back under ``response._meta.otel.traces.resourceSpans``
-    and we forward them to Galileo via the helper from ``instrumentation``.
+    proper Tool icon and drill-down. Injects ``traceparent`` into ``_meta``
+    so the server's spans (when passback is enabled) share our trace ID.
+
+    With ``passback=True`` (default for this demo): adds
+    ``_meta.otel.traces.{request: True, detailed: True}`` to opt into the
+    full server span tree (phase spans + HTTPX child spans). The server's
+    spans come back under ``response._meta.otel.traces.resourceSpans`` and
+    we forward them to Galileo via ``ingest_passback_to_galileo``.
+
+    With ``passback=False``: omits the ``otel`` field entirely. The server
+    returns no ``resourceSpans`` and the agent-side ``ToolSpan`` is the
+    only record of the call — the server is a black box. This matches the
+    "Act 1" mode of the reference impl, useful for showing what
+    observability looks like *without* SEP-2448.
     """
     tool = ToolSpan(
         name=tool_name,
@@ -247,10 +378,9 @@ async def _call_mcp_tool_with_passback(
         carrier: dict[str, str] = {}
         propagator.inject(carrier)
 
-        meta: dict[str, Any] = {
-            "traceparent": carrier.get("traceparent", ""),
-            "otel": {"traces": {"request": True, "detailed": detailed}},
-        }
+        meta: dict[str, Any] = {"traceparent": carrier.get("traceparent", "")}
+        if passback:
+            meta["otel"] = {"traces": {"request": True, "detailed": True}}
 
         result = await session.call_tool(tool_name, arguments=tool_args, meta=meta)
 
@@ -270,7 +400,10 @@ async def _call_mcp_tool_with_passback(
         # Cap stored tool output to keep span attributes manageable.
         tool.output = text[:5000]
 
-        ingest_passback_to_galileo(result.meta)
+        if passback:
+            ingest_passback_to_galileo(result.meta)
+        else:
+            print("  Server-side spans: NONE (passback not requested)")
         return text
 
 
@@ -283,12 +416,14 @@ async def execute_workflow(
     session: ClientSession,
     mcp_tools: list[Any],
     user_query: str,
-    detailed: bool,
+    passback: bool,
 ) -> str | None:
     """Run the LangChain agent loop, with each tool call going over MCP.
 
     Wrapped in a Galileo ``WorkflowSpan`` so the whole trajectory anchors
-    under one root in the UI.
+    under one root in the UI. ``passback`` controls whether each tool call
+    requests SEP-2448 server-execution telemetry (default) or runs as a
+    black-box call (``--no-passback``).
     """
     propagator = TraceContextTextMapPropagator()
     openai_tools = [_mcp_to_openai_tool(t) for t in mcp_tools]
@@ -318,12 +453,12 @@ async def execute_workflow(
                 break
 
             for tc in tool_calls:
-                output = await _call_mcp_tool_with_passback(
+                output = await _call_mcp_tool(
                     session=session,
                     tool_name=tc["name"],
                     tool_args=tc["args"],
                     tool_call_id=tc["id"],
-                    detailed=detailed,
+                    passback=passback,
                     propagator=propagator,
                 )
                 messages.append({
@@ -339,32 +474,6 @@ async def execute_workflow(
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="LangChain agent for the Arcade x Galileo demo with SEP-2448 passback",
-    )
-    parser.add_argument(
-        "query",
-        nargs="?",
-        default=(
-            "Find my 3 most recent emails from alex.salazar@arcade.dev. "
-            "Then email a one-paragraph summary of them to me at $ARCADE_USER_ID."
-        ),
-        help="Natural-language task for the agent (use $ARCADE_USER_ID as a stand-in)",
-    )
-    parser.add_argument(
-        "--detailed",
-        action="store_true",
-        help="Request the full server span tree (incl. HTTPX child spans)",
-    )
-    parser.add_argument(
-        "--server-url",
-        default=DEFAULT_SERVER_URL,
-        help=f"Local MCP server URL (default: {DEFAULT_SERVER_URL})",
-    )
-    return parser.parse_args()
 
 
 def _print_galileo_trace_url() -> None:
@@ -390,7 +499,10 @@ def _print_galileo_trace_url() -> None:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="  %(message)s")
-    args = parse_args()
+    # CLI was already parsed at module load time so the per-mode log stream
+    # name could be set in os.environ before instrumentation imported.
+    args = _cli_args
+    passback = _passback
 
     validate_environment()
     user_id = os.environ["ARCADE_USER_ID"]
@@ -399,7 +511,8 @@ async def main() -> None:
     print("=" * 60)
     print("Arcade + Galileo Integration Demo (server-span passback)")
     print("=" * 60)
-    print(f"\n  Mode:         {'detailed (full tree)' if args.detailed else 'phases only'}")
+    print(f"\n  Mode:         {'passback (full server tree)' if passback else 'no-passback (server is a black box)'}")
+    print(f"  Log stream:   {os.environ['GALILEO_LOG_STREAM']}")
     print(f"  MCP server:   {args.server_url}")
     print(f"  Query:        {user_query}\n")
 
@@ -445,7 +558,7 @@ async def main() -> None:
                 session=session,
                 mcp_tools=discovered.tools,
                 user_query=user_query,
-                detailed=args.detailed,
+                passback=passback,
             )
 
             if result:

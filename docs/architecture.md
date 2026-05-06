@@ -11,12 +11,15 @@ flowchart LR
     user([You])
 
     subgraph local [Your machine]
+        direction TB
         subgraph procA [workflow.py — agent process]
+            direction TB
             wf["LangChain agent loop<br/>(ChatOpenAI + bind_tools)"]
             ins["instrumentation.py<br/>(GalileoSpanProcessor +<br/>LangChainInstrumentor +<br/>ingest_passback_to_galileo)"]
             wf -- imports --> ins
         end
         subgraph procB [server.py — local MCP server]
+            direction TB
             srv["MCPApp<br/>+ TelemetryPassbackMiddleware<br/>+ HTTPXClientInstrumentor"]
             tools[("ArcadeGalileoDemoServer_ListEmails<br/>ArcadeGalileoDemoServer_SendEmail")]
             srv --- tools
@@ -70,7 +73,7 @@ This is the new piece (vs. the old `arcadepy`-based demo). It runs an Arcade `MC
 1. The middleware reads `_meta.traceparent` (the agent's trace context) and `_meta.otel.traces.{request, detailed}` (passback opt-in flags).
 2. It opens a SERVER-kind span under the agent's trace, so the parent linkage stitches automatically.
 3. The tool function runs. Each logical phase (auth check, Gmail list, Gmail per-message fetch, response formatting) is wrapped in `tracer.start_as_current_span(...)` with `gen_ai.*` semantic-convention attributes. `HTTPXClientInstrumentor` adds child spans for every `httpx` HTTP call.
-4. After the tool returns, the middleware pulls all spans created during the request out of its in-memory buffer, serializes them to OTLP JSON, and attaches them to `response._meta.otel.traces.resourceSpans` (and `truncated` / `droppedSpanCount` if the agent didn't ask for `--detailed` and child spans were filtered out).
+4. After the tool returns, the middleware pulls all spans created during the request out of its in-memory buffer, serializes them to OTLP JSON, and attaches them to `response._meta.otel.traces.resourceSpans`. (The middleware's `truncated` / `droppedSpanCount` filtering is unreachable from this demo — we always send `_meta.otel.traces.detailed: True` — but it remains in the wire format for any client that opts into a phase-only view.)
 
 `ResourceServerAuth` validates Bearer tokens against `cloud.arcade.dev/oauth2`'s JWKS (RFC 9728 OAuth 2.1). The `ArcadeResourceServerAuth` subclass swaps `user_id` to the JWT's `email` claim so Arcade's Google OAuth broker matches the right user when `@tool(requires_auth=Google(...))` runs.
 
@@ -91,12 +94,12 @@ with otel.start_galileo_span(workflow):
             tool = ToolSpan(name=tc["name"], input=..., tool_call_id=tc["id"])
             with otel.start_galileo_span(tool):
                 propagator.inject(carrier)
-                meta = {
-                    "traceparent": carrier["traceparent"],
-                    "otel": {"traces": {"request": True, "detailed": detailed}},
-                }
+                meta = {"traceparent": carrier["traceparent"]}
+                if passback:  # default; --no-passback omits the otel field entirely
+                    meta["otel"] = {"traces": {"request": True, "detailed": True}}
                 result = await session.call_tool(tc["name"], arguments=tc["args"], meta=meta)
-                ingest_passback_to_galileo(result.meta)
+                if passback:
+                    ingest_passback_to_galileo(result.meta)
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
 ```
 

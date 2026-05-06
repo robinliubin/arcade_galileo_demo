@@ -23,7 +23,7 @@ sequenceDiagram
 
     user->>wf: .venv/bin/python workflow.py
     wf->>ins: import (side-effecting)
-    ins->>ins: load_dotenv(); validate Galileo env
+    ins->>ins: load_dotenv() + validate Galileo env
     ins->>ins: galileo_context.init(project, log_stream)
     ins->>ins: TracerProvider + add_galileo_span_processor(...)
     ins->>ins: LangChainInstrumentor().instrument(...)
@@ -53,10 +53,10 @@ sequenceDiagram
     wf->>srv: tools/call ArcadeGalileoDemoServer_ListEmails<br/>_meta = {traceparent, otel.traces.{request,detailed}}
     srv->>srv: TelemetryPassbackMiddleware opens SERVER span<br/>under agent's trace
     srv->>srv: auth.validate phase span
-    srv->>gmail: GET /messages?q=from:... (HTTPX child span, --detailed only)
+    srv->>gmail: GET /messages?q=from:... (HTTPX child span, default mode)
     gmail-->>srv: {messages: [...]}
     loop per message
-        srv->>gmail: GET /messages/<id> (HTTPX child span, --detailed only)
+        srv->>gmail: GET /messages/<id> (HTTPX child span, default mode)
         gmail-->>srv: metadata
     end
     srv->>srv: format_response phase span
@@ -74,7 +74,7 @@ sequenceDiagram
     note over wf,srv: ToolSpan(name="ArcadeGalileoDemoServer_SendEmail")
     wf->>srv: tools/call ArcadeGalileoDemoServer_SendEmail<br/>_meta = {traceparent, otel...}
     srv->>srv: auth.validate + gmail.send_message + format_response
-    srv->>gmail: POST /messages/send (HTTPX child, --detailed only)
+    srv->>gmail: POST /messages/send (HTTPX child, default mode)
     gmail-->>srv: {id, status}
     srv-->>wf: response with passback _meta
     wf->>g: ingest_passback_to_galileo(meta)
@@ -157,8 +157,8 @@ For the default user query, the loop converges in **3 rounds**:
 
 | Round | LLM picks | Server returns |
 |---|---|---|
-| 1 | `ArcadeGalileoDemoServer_ListEmails(max_results=3, query="from:alex.salazar@arcade.dev")` | List of 3 email metadata records + passback resourceSpans (6 spans default; +3 with `--detailed`) |
-| 2 | `ArcadeGalileoDemoServer_SendEmail(to=user_email, subject=..., body=summary)` | `{message_id, status:"sent"}` + passback resourceSpans (5 spans default; +1 with `--detailed`) |
+| 1 | `ArcadeGalileoDemoServer_ListEmails(max_results=3, query="from:alex.salazar@arcade.dev")` | List of 3 email metadata records + 10 passback `resourceSpans` (6 phase + 4 HTTPX children; 0 with `--no-passback`) |
+| 2 | `ArcadeGalileoDemoServer_SendEmail(to=user_email, subject=..., body=summary)` | `{message_id, status:"sent"}` + 6 passback `resourceSpans` (5 phase + 1 HTTPX child; 0 with `--no-passback`) |
 | 3 | Final answer (no `tool_calls`) | — |
 
 Note the **server-name prefix**: `arcade-mcp-server` namespaces tool functions by prefixing the CamelCased server name (`MCPApp(name="arcade_galileo_demo_server")` → `ArcadeGalileoDemoServer_*`). This happens at `MCPApp` registration time, so `session.list_tools()` returns the prefixed names and the LLM sees them as plain function names. There's no transformation in `workflow.py`.
@@ -169,13 +169,13 @@ For each tool call:
 tool = ToolSpan(name=tc["name"], input=json.dumps(tc["args"]), tool_call_id=tc["id"])
 with otel.start_galileo_span(tool):
     propagator.inject(carrier)
-    meta = {
-        "traceparent": carrier["traceparent"],
-        "otel": {"traces": {"request": True, "detailed": detailed}},
-    }
+    meta = {"traceparent": carrier["traceparent"]}
+    if passback:  # default; --no-passback omits the otel field
+        meta["otel"] = {"traces": {"request": True, "detailed": True}}
     result = await session.call_tool(tc["name"], arguments=tc["args"], meta=meta)
     tool.output = result.content[0].text[:5000]
-    ingest_passback_to_galileo(result.meta)
+    if passback:
+        ingest_passback_to_galileo(result.meta)
 ```
 
 The active span when `propagator.inject(carrier)` runs is the `ToolSpan`, so `traceparent` carries that span's trace ID + span ID. The server creates its `tools/call <toolname>` SERVER span as a child of the `ToolSpan` — the parent linkage is the entire stitch.
@@ -189,7 +189,7 @@ The active span when `propagator.inject(carrier)` runs is the `ToolSpan`, so `tr
 3. Open a SERVER-kind span named `tools/call <toolname>` — child of the `ToolSpan` via the trace context.
 4. Run the tool function. Inside the tool, `tracer.start_as_current_span(...)` calls produce the phase spans (`auth.validate`, `gmail.list_messages`, ...) as children of the SERVER span. `HTTPXClientInstrumentor` adds HTTP child spans under each phase.
 5. After the tool returns, the middleware pulls all spans associated with this request out of its in-memory buffer.
-6. If `detailed=True`, include all spans. If `detailed=False`, include only top-level phase spans + the SERVER span; set `truncated=True` and `droppedSpanCount=N` to advertise that more was filtered.
+6. Include all spans (this demo always sends `detailed=True`). The middleware's filter-to-phase-spans path — where it would set `truncated=True` and `droppedSpanCount=N` — exists in the wire format but is unreachable from this demo.
 7. Serialize to OTLP JSON, attach to `response._meta.otel.traces.resourceSpans`.
 
 **7. First-time-per-scope Google OAuth dance**
@@ -225,9 +225,11 @@ finally:
 
 ## What the Galileo trace looks like
 
-In Galileo UI → project `arcade-galileo-demo` → log stream `default`, one invocation produces **one trace**.
+In Galileo UI → project `arcade-galileo-demo` → log stream `arcade-galileo-demo-passback` (default-mode runs) or `arcade-galileo-demo-no-passback` (runs with `--no-passback`), one invocation produces **one trace**. The trace's *shape* depends on whether server-side passback succeeded — same agent code, same `WorkflowSpan` root, but radically different observability inside each tool call. The two modes write to differently-suffixed log streams so they're easy to compare side-by-side without filtering.
 
-> The shape below was verified end-to-end against `console-bin-citizens.gcp-dev.galileo.ai` on 2026-04-29. Default-mode passback returned 6 server spans on round 1 (`ArcadeGalileoDemoServer_ListEmails`) and 5 on round 2 (`ArcadeGalileoDemoServer_SendEmail`), with `(3 additional)` and `(1 additional)` HTTPX spans available via `--detailed` respectively. All passback POSTs to `<console>/api/galileo/otel/traces` returned HTTP 200.
+### With SEP-2448 passback (this demo's default)
+
+> The shape below was verified end-to-end against `console-bin-citizens.gcp-dev.galileo.ai` on 2026-04-29 (with the now-removed `--detailed` flag, which exercised the same `detailed: True` path the new default does). Default mode returned 10 server spans on round 1 (`ArcadeGalileoDemoServer_ListEmails`: 1 SERVER + 4 phase + 1 internal middleware + 4 HTTPX children) and 6 on round 2 (`ArcadeGalileoDemoServer_SendEmail`: 1 SERVER + 3 phase + 1 internal middleware + 1 HTTPX POST). All passback POSTs to `<console>/api/galileo/otel/traces` returned HTTP 200.
 
 ```
 arcade_galileo_workflow                                  (WorkflowSpan)
@@ -248,11 +250,11 @@ arcade_galileo_workflow                                  (WorkflowSpan)
 │   └── tools/call ArcadeGalileoDemoServer_ListEmails    (SERVER, from passback)
 │       ├── auth.validate                                (gen_ai.tool.name=auth.validate)
 │       ├── gmail.list_messages                          (gmail.message_count=3)
-│       │   └── GET messages                             (HTTP child, --detailed only)
+│       │   └── GET messages                             (HTTP child, default mode)
 │       ├── gmail.fetch_details                          (gmail.fetch_count=3)
-│       │   ├── GET messages/<id1>                       (--detailed only)
-│       │   ├── GET messages/<id2>                       (--detailed only)
-│       │   └── GET messages/<id3>                       (--detailed only)
+│       │   ├── GET messages/<id1>                       (HTTP child, default mode)
+│       │   ├── GET messages/<id2>                       (HTTP child, default mode)
+│       │   └── GET messages/<id3>                       (HTTP child, default mode)
 │       └── format_response                              (email.count=3)
 
 ├── ChatOpenAI                                           (round 2 — sees email list)
@@ -260,18 +262,68 @@ arcade_galileo_workflow                                  (WorkflowSpan)
 │   └── tools/call ArcadeGalileoDemoServer_SendEmail     (SERVER)
 │       ├── auth.validate
 │       ├── gmail.send_message                           (gmail.recipient=..., gmail.subject=...)
-│       │   └── POST messages/send                       (--detailed only)
+│       │   └── POST messages/send                       (HTTP child, default mode)
 │       └── format_response
 └── ChatOpenAI                                           (round 3 — final answer)
 ```
 
-**What to point at during a live demo:**
+### Without passback (server is a black box)
 
-- The **workflow root** anchors the whole agent trajectory.
-- Each **ChatOpenAI** span shows the exact prompt and response — including `tool_calls` proving the LLM is choosing tools, not hallucinating.
-- The **agent-side `ToolSpan`** (e.g. `ArcadeGalileoDemoServer_ListEmails`) shows what the agent saw: the args it sent and the result text it received.
-- The **SERVER span** (`tools/call list_emails`) and its children show what *actually happened* on the server. Without passback this entire subtree is invisible — the tool call is opaque.
-- With `--detailed`, the **HTTP child spans** under `gmail.fetch_details` reveal the per-message sequential-fetch waterfall that makes that phase the slowest part of the request. That's the point of the SEP: the agent author can diagnose server-side performance without server-side access.
+What the same trace looks like if the server didn't return `_meta.otel.traces.resourceSpans`, the agent didn't request passback, or `ingest_passback_to_galileo` silently no-op'd:
+
+```
+arcade_galileo_workflow                                  (WorkflowSpan)
+    workflow.input  = "Find my 3 most recent emails from alex.salazar..."
+    workflow.output = "I have summarized your 3 most recent emails ..."
+
+├── ChatOpenAI                                           (OpenInference, auto)
+│   llm.input_messages, llm.output_messages, llm.token_count.* — same as above
+
+├── ArcadeGalileoDemoServer_ListEmails                   (ToolSpan — agent-side ONLY)
+│   tool.input    = {"max_results":3, "query":"from:alex.salazar@arcade.dev"}
+│   tool.output   = "{\"emails\":[...]}"
+│   tool_call_id  = call_abc123
+│   duration      = ~2s total                ← visible, but no breakdown of why
+│   (no SERVER child — the inside of this 2s is opaque)
+
+├── ChatOpenAI                                           (round 2)
+├── ArcadeGalileoDemoServer_SendEmail                    (ToolSpan — agent-side ONLY)
+│   tool.input    = {"to":"...", "subject":"...", "body":"..."}
+│   tool.output   = "{\"message_id\":\"...\", \"status\":\"sent\"}"
+│   duration      = ~1s total
+│   (no SERVER child)
+└── ChatOpenAI                                           (round 3 — final answer)
+```
+
+**When this happens:**
+
+- **The MCP server doesn't ship `TelemetryPassbackMiddleware`.** Older server, vendor server that hasn't adopted SEP-2448, or `arcade-mcp-server` pinned to a pre-PR-797 version. `init.capabilities.serverExecutionTelemetry` comes back `None` after the handshake. `workflow.py` doesn't gate on this — it sends the opt-in flag anyway, the server ignores it, and the response carries no `resourceSpans`. **This is the "before" picture for any customer pointing this same agent at a vendor MCP server.**
+- **The agent didn't set `_meta.otel.traces.request: true`.** This is exactly what `--no-passback` does: in `workflow.py:_call_mcp_tool`, the `otel` field is conditionally added to `_meta` only when `passback=True`. Pass `--no-passback` to demo "Act 1: The Black Box" — no server spans, only agent-side `ToolSpan`s in Galileo.
+- **An intermediate proxy stripped `_meta`.** `_meta` is part of MCP's JSON-RPC payload (not HTTP headers), so payload-rewriting middleboxes that re-serialize JSON-RPC requests can drop it. Rare, but worth knowing about.
+- **`ingest_passback_to_galileo` silently no-op'd.** Missing `protobuf` / `opentelemetry-proto` deps, OTLP endpoint unreachable, or 4xx from Galileo. The helper logs warnings but doesn't raise — check the agent's stderr for `"Skipping Galileo passback export"` or `"Galileo passback ingest returned HTTP ..."`.
+
+**What you lose:**
+
+- **The internal breakdown of each tool call.** With passback, the ~2s of `list_emails` decomposes into auth (50ms), list (400ms), fetch (1.6s — the bottleneck), format (5ms). Without passback, you see the ~2s and have to *guess* whether it's auth, network, the Gmail API, or the server's own logic.
+- **All `gen_ai.*` semantic-convention attributes** the server set on phase spans (`gmail.message_count`, `gmail.fetch_count`, `email.count`, `auth.method`, etc.).
+- **The HTTPX child waterfall.** The headline finding — that `gmail.fetch_details` is N+1 sequential GETs — is exactly what the default-mode HTTP child spans expose, and exactly what `--no-passback` removes. Without passback, you have no way to see the per-request fan-out at all.
+- **Server-side errors that happened before the tool produced its output.** With passback, a 500ms `auth.validate` followed by an immediate 503 from Gmail shows up as two distinct spans with status codes; without passback, the agent sees only the final exception text in `tool.output`.
+
+**What you keep** (because it's all agent-side):
+
+- The workflow root and the LLM-reasoning trajectory: every `ChatOpenAI` span with full input/output messages and token counts.
+- Each `ToolSpan`'s input args, output text, and *total* duration. So "the LLM picked the right tool", "the call returned this result", and "the call took 2s" remain answerable — you just can't answer "where in the 2s did the time go?".
+- All MCP-protocol-level errors that surfaced as exceptions ("tool not found", schema validation failures, transport errors).
+
+This is the asymmetry SEP-2448 closes: agent-side instrumentation alone makes the LLM's reasoning observable but leaves the tool boundary as a black box. Adding passback fills in the box without giving the agent author server-side access — which is the entire point of the SEP.
+
+### What to point at during a live demo
+
+- The **workflow root** anchors the whole agent trajectory in both shapes.
+- Each **`ChatOpenAI`** span shows the exact prompt and response — including `tool_calls` proving the LLM is choosing tools, not hallucinating. Same in both shapes.
+- The **agent-side `ToolSpan`** (e.g. `ArcadeGalileoDemoServer_ListEmails`) shows what the agent saw: the args it sent, the result text it received, and the wall-clock duration. **Same in both shapes** — this is the part of observability you get for free.
+- The **SERVER span** (`tools/call list_emails`) and its children show what *actually happened* on the server. **This is the entire diff between the two trees.** If you're presenting live, click into one of these phase spans to show the `gen_ai.*` attributes — that's the moment "passback works" becomes concrete.
+- The **HTTP child spans** under `gmail.fetch_details` (visible in default mode) reveal the per-message sequential-fetch waterfall — the headline performance finding. Run a second invocation with `--no-passback` so the audience sees the *absence* of the SERVER subtree side-by-side with the full tree from the first run — that's the most direct way to make the SEP's value concrete.
 
 ## Pitfalls the trace helps you catch
 

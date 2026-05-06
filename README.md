@@ -32,9 +32,8 @@ The point of this demo is the **stitch**: client-side LLM/tool spans (from `Lang
 - [`uv`](https://docs.astral.sh/uv/) — Python project/package manager. Install: `brew install uv` or `curl -LsSf https://astral.sh/uv/install.sh | sh`.
 - API keys for OpenAI, Arcade, and Galileo (see below).
 - A Google account willing to OAuth-authorize Gmail (read + send) for the `ARCADE_USER_ID` you choose.
-- The sibling [`arcade-mcp`](https://github.com/ArcadeAI/arcade-mcp) checkout at `../arcade-mcp/` — `pyproject.toml` installs `arcade-mcp-server` editable from there, because `TelemetryPassbackMiddleware` isn't published to PyPI yet.
 
-`uv` handles the Python toolchain, venv, and dependencies. The project requires Python 3.11+; `uv` will fetch it automatically if missing.
+`uv` handles the Python toolchain, venv, and dependencies. The project requires Python 3.11+; `uv` will fetch it automatically if missing. All Arcade libraries (including `TelemetryPassbackMiddleware` in `arcade-mcp-server>=1.21.3`) install from PyPI.
 
 ### Getting the API keys
 
@@ -66,14 +65,7 @@ cp .env.example .env
 # (and GALILEO_CONSOLE_URL if you're on a non-default cluster)
 
 uv sync
-
-# macOS only — clear UF_HIDDEN on the editable .pth files so Python's site.py
-# doesn't silently skip them. Required for arcade-mcp-server's editable install.
-chflags nohidden .venv/lib/python*/site-packages/_editable_impl_*.pth \
-                 .venv/lib/python*/site-packages/_virtualenv.pth
 ```
-
-> **Use `.venv/bin/python`, not `uv run python`, on macOS.** `uv run` re-applies the `UF_HIDDEN` flag on every invocation, undoing the `chflags` above. Direct invocation of the venv's interpreter doesn't.
 
 You need **two terminals**.
 
@@ -98,11 +90,11 @@ Then, on the *very first* `ArcadeGalileoDemoServer_ListEmails` / `ArcadeGalileoD
 ### CLI flags
 
 ```bash
-# Top-level phase spans only (default — auth, list, fetch, format)
+# Default — passback enabled with full detail (phase spans + HTTPX child spans)
 .venv/bin/python workflow.py
 
-# Full server span tree, including HTTPX child spans under each phase
-.venv/bin/python workflow.py --detailed
+# No passback — server is a black box; Galileo sees only agent-side ToolSpans
+.venv/bin/python workflow.py --no-passback
 
 # Different query
 .venv/bin/python workflow.py "List my 5 most recent unread emails"
@@ -111,14 +103,15 @@ Then, on the *very first* `ArcadeGalileoDemoServer_ListEmails` / `ArcadeGalileoD
 .venv/bin/python workflow.py --server-url http://127.0.0.1:8000/mcp
 ```
 
-Expected console output (default mode):
+Expected console output (default mode — passback enabled):
 
 ```
 ============================================================
 Arcade + Galileo Integration Demo (server-span passback)
 ============================================================
 
-  Mode:         phases only
+  Mode:         passback (full server tree)
+  Log stream:   arcade-galileo-demo-passback
   MCP server:   http://127.0.0.1:8000/mcp
   Query:        Find my 3 most recent emails from alex.salazar@arcade.dev. ...
 
@@ -129,10 +122,8 @@ Arcade + Galileo Integration Demo (server-span passback)
 
 Executing workflow...
 
+  Server-side spans: 10 received and forwarded to Galileo
   Server-side spans: 6 received and forwarded to Galileo
-  (3 additional spans available with --detailed)
-  Server-side spans: 5 received and forwarded to Galileo
-  (1 additional spans available with --detailed)
 
 ============================================================
 Workflow completed successfully!
@@ -146,17 +137,17 @@ else you need!
 ✓ View this trace at: https://app.galileo.ai/project/<id>/log-streams/<id>
 ```
 
-> **Why 6 + 5 spans?** Each `tools/call` produces one SERVER root + the tool's phase spans. `list_emails` adds 5 phase spans (auth.validate, gmail.list_messages, gmail.fetch_details, format_response, plus an internal middleware span) on top of the SERVER root = 6 total. `send_email` is one phase shorter (no fetch_details), so 5 total. The `(N additional spans available with --detailed)` lines are the HTTPX child spans the server filtered out.
+> **Why 10 + 6 spans?** Each `tools/call` returns one SERVER root + the tool's phase spans + the HTTPX child spans under each phase. `list_emails`: 1 SERVER + 4 phase spans (auth.validate, gmail.list_messages, gmail.fetch_details, format_response) + 1 internal middleware span + 4 HTTPX children (1 list + 3 detail-fetches per the default `max_results=3`) = 10 total. `send_email` is one phase shorter (no `fetch_details`) and one HTTP child shorter, so 6 total. With `--no-passback`, both numbers go to 0 — the response carries no `resourceSpans` and the agent prints `Server-side spans: NONE (passback not requested)` instead.
 
 > **Tool naming.** `arcade-mcp-server` namespaces tool functions by prefixing the server name in CamelCase: `list_emails` → `ArcadeGalileoDemoServer_ListEmails`. The agent's `bind_tools` flow uses these names verbatim — the LLM sees them as plain function names, no transformation needed.
 
 ## See the trace in Galileo
 
-![Stitched client+server trace in Galileo (with --detailed)](docs/trace_view.png)
+![Stitched client+server trace in Galileo (default passback mode)](docs/trace_view.png)
 
-Above: a `--detailed` run from the demo as it renders in Galileo. The agent-side `arcade_galileo_workflow` root, `ChatOpenAI` LLM spans, and `ArcadeGalileoDemoServer_ListEmails`/`SendEmail` ToolSpans are all from this process. Everything underneath each ToolSpan — the `auth.validate`, `gmail.list_messages`/`gmail.fetch_details`/`gmail.send_message` phase spans, and the `GET messages` / `GET messages/<id>` HTTP child spans — comes from the local server via SEP-2448 passback. The waterfall under `gmail.fetch_details` (one HTTP child per message) is the kind of internal detail an agent author normally can't see — that's the value proposition.
+Above: a default-mode run as it renders in Galileo. The agent-side `arcade_galileo_workflow` root, `ChatOpenAI` LLM spans, and `ArcadeGalileoDemoServer_ListEmails`/`SendEmail` ToolSpans are all from this process. Everything underneath each ToolSpan — the `auth.validate`, `gmail.list_messages`/`gmail.fetch_details`/`gmail.send_message` phase spans, and the `GET messages` / `GET messages/<id>` HTTP child spans — comes from the local server via SEP-2448 passback. The waterfall under `gmail.fetch_details` (one HTTP child per message) is the kind of internal detail an agent author normally can't see — that's the value proposition.
 
-Open Galileo UI → project `arcade-galileo-demo` → log stream `default`. Open the most recent trace. You should see a tree shaped like:
+Open Galileo UI → project `arcade-galileo-demo` → log stream `arcade-galileo-demo-passback` (or `arcade-galileo-demo-no-passback` if you ran with `--no-passback`). Open the most recent trace. You should see a tree shaped like:
 
 ```
 arcade_galileo_workflow                                  (WorkflowSpan, root)
@@ -165,9 +156,9 @@ arcade_galileo_workflow                                  (WorkflowSpan, root)
 │   └── tools/call ArcadeGalileoDemoServer_ListEmails    (SERVER, from passback)
 │       ├── auth.validate
 │       ├── gmail.list_messages
-│       │   └── GET messages                             (only with --detailed)
+│       │   └── GET messages                             (HTTP child, default mode)
 │       ├── gmail.fetch_details
-│       │   ├── GET messages/<id>                        (only with --detailed; one per email)
+│       │   ├── GET messages/<id>                        (HTTP child, default mode; one per email)
 │       │   └── ...
 │       └── format_response
 ├── ChatOpenAI                                           (round 2)
@@ -175,7 +166,7 @@ arcade_galileo_workflow                                  (WorkflowSpan, root)
 │   └── tools/call ArcadeGalileoDemoServer_SendEmail     (SERVER)
 │       ├── auth.validate
 │       ├── gmail.send_message
-│       │   └── POST messages/send                       (only with --detailed)
+│       │   └── POST messages/send                       (HTTP child, default mode)
 │       └── format_response
 └── ChatOpenAI                                           (final)
 ```
@@ -184,9 +175,22 @@ The thing to notice: **everything below `tools/call <toolname>` is server-side**
 
 See [`docs/call-flow.md`](docs/call-flow.md) for the full sequence diagram and [`docs/architecture.md`](docs/architecture.md) for the trust-boundary breakdown.
 
-## Granularity control: `--detailed`
+## Passback control: `--no-passback`
 
-The default mode returns only top-level phase spans (6 spans per `ArcadeGalileoDemoServer_ListEmails` call: SERVER root + auth + list + fetch + format + an internal middleware span). The `--detailed` flag asks the server's middleware to include the HTTPX child spans too — and importantly, **N HTTP spans under `gmail.fetch_details`** revealing the sequential-fetch waterfall. That's the SEP's filtering knob: the server vendor decides what to expose, the client opts in.
+By default, every `tools/call` requests the **full** server span tree — all phase spans plus the HTTPX child spans under each phase. The N HTTP children under `gmail.fetch_details` reveal the sequential-fetch waterfall, and that's the headline performance finding the demo is built around.
+
+Pass `--no-passback` to skip the SEP-2448 opt-in entirely. The `_meta.otel` field is omitted from each `tools/call`, the server returns no `resourceSpans`, and Galileo sees only the agent-side `WorkflowSpan` + `ChatOpenAI` + `ToolSpan`s — no `tools/call` SERVER subtree, no phase spans, no HTTP children. This is the "Act 1: black box" mode for showing what observability looks like *without* SEP-2448, useful for a before/after comparison.
+
+**Each mode writes to a different Galileo log stream** so the two trace shapes are trivial to compare side-by-side. `workflow.py` suffixes `GALILEO_LOG_STREAM` at startup based on the CLI mode:
+
+| CLI | Resolved log stream |
+|---|---|
+| `python workflow.py` | `<base>-passback` (default base: `arcade-galileo-demo`) |
+| `python workflow.py --no-passback` | `<base>-no-passback` |
+
+The agent prints the resolved name in its startup banner (`Log stream: arcade-galileo-demo-passback`). Run both modes and Galileo's project view will show two streams; open each and you have the "with-passback" tree and the "no-passback" tree side-by-side, no filtering required.
+
+> Historical note: the previous CLI had a `--detailed` flag that toggled HTTPX inclusion separately from passback opt-in. That flag was removed — `detailed: True` is now hardcoded whenever passback is requested, since "phase spans without HTTP children" turned out not to be a useful intermediate point.
 
 ## Swapping the toolkit
 
