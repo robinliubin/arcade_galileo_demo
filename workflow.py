@@ -50,6 +50,17 @@ DEFAULT_LLM_TEMPERATURE = 0.7
 DEFAULT_SERVER_URL = "http://127.0.0.1:8000/mcp"
 DEFAULT_LOG_STREAM_BASE = "arcade-galileo-demo"
 
+# Used when no positional `query` argument is supplied on the command line.
+# The literal string `$ARCADE_USER_ID` is substituted at runtime with the
+# value loaded from .env, so the default query references whichever email
+# account you've authorized with Arcade. Override per-invocation by passing
+# any string as the first positional argument:
+#   .venv/bin/python workflow.py "Summarize my last 5 emails"
+DEFAULT_QUERY = (
+    "Find my 3 most recent emails from alex.salazar@arcade.dev. "
+    "Then email a one-paragraph summary of them to me at $ARCADE_USER_ID."
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 OAUTH_TOKEN_FILE = PROJECT_ROOT / ".oauth_tokens.json"
 OAUTH_CLIENT_FILE = PROJECT_ROOT / ".oauth_client.json"
@@ -74,11 +85,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "query",
         nargs="?",
-        default=(
-            "Find my 3 most recent emails from alex.salazar@arcade.dev. "
-            "Then email a one-paragraph summary of them to me at $ARCADE_USER_ID."
+        default=DEFAULT_QUERY,
+        help=(
+            "Natural-language task for the agent. If omitted, uses DEFAULT_QUERY "
+            "from the top of this file (a built-in demo query). The literal "
+            "`$ARCADE_USER_ID` in any query is substituted with your .env value "
+            "at runtime. Example: "
+            '.venv/bin/python workflow.py "Summarize my last 5 emails"'
         ),
-        help="Natural-language task for the agent (use $ARCADE_USER_ID as a stand-in)",
     )
     parser.add_argument(
         "--no-passback",

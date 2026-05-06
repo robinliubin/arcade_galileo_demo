@@ -271,7 +271,7 @@ Pass it on the command line:
 .venv/bin/python workflow.py "List my 5 most recent unread emails"
 ```
 
-Or edit the default in `workflow.py`'s `parse_args()`. Use the literal string `$ARCADE_USER_ID` and the agent will substitute your `.env` value at runtime.
+Or edit the `DEFAULT_QUERY` constant near the top of `workflow.py` to change what runs when no positional argument is given. Use the literal string `$ARCADE_USER_ID` anywhere in your query — the agent substitutes your `.env` value at runtime.
 
 ### Add a new tool
 
